@@ -1,0 +1,5 @@
+# Optional local models (NLI claim verifier + cross-encoder re-ranker). Heavy: ~2 GB with torch.
+-r requirements.txt
+torch>=2.3
+transformers>=4.44
+sentence-transformers>=3.0

@@ -1,0 +1,14 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pydantic-settings>=2.4
+pymongo>=4.8
+qdrant-client>=1.11
+openai>=1.50
+langgraph>=0.2
+rank-bm25>=0.2.2
+pyjwt[crypto]>=2.9
+pymupdf>=1.24
+markitdown[docx]>=0.0.1a2
+azure-identity>=1.17
+azure-keyvault-secrets>=4.8

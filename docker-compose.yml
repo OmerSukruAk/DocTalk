@@ -1,0 +1,18 @@
+# docker compose up --build   ->   API on http://localhost:8000/docs
+services:
+  api:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes: ["files:/data/files"]
+    depends_on: [mongo, qdrant, dev-issuer]
+  mongo:
+    image: mongo:7
+    volumes: ["mongo:/data/db"]
+  qdrant:
+    image: qdrant/qdrant:v1.11.0
+    volumes: ["qdrant:/qdrant/storage"]
+  dev-issuer:          # demo-only Entra stand-in; remove when AUTH_MODE=entra
+    build: ./dev_issuer
+    ports: ["9000:9000"]
+volumes: { files: {}, mongo: {}, qdrant: {} }
