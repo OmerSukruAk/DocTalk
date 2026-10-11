@@ -59,7 +59,12 @@ def render(resp: dict) -> None:
         print(f"    [{c['n']}] {c['document_name']} - {where} - {c['sentence_id']}")
         print(textwrap.fill(f"\"{c['text']}\"", 96, initial_indent="        ", subsequent_indent="        "))
     m = resp["metrics"]
-    print(f"  ({m['total_ms']} ms, {m['tokens_in']}+{m['tokens_out']} tokens, ${m['cost_usd']})\n")
+    print(f"  ({m['total_ms']} ms, {m['tokens_in']}+{m['tokens_out']} tokens, ${m['cost_usd']})")
+    t = m.get("timings_ms") or {}
+    parts = [f"{stage} {t[stage] / 1000:.1f}s" for stage in t if t[stage] >= 1 or stage in ("retrieve", "generate", "verify")]
+    if parts:
+        print(f"  time: {' | '.join(parts)}")
+    print()
 
 
 def main() -> int:

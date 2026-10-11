@@ -33,6 +33,30 @@ def test_grounded_answer_has_verifiable_citation(ready):
     assert stored["text"] == cit["text"]  # citation text is the stored sentence, never model output
 
 
+def test_metrics_break_time_down_by_stage_and_count_the_verifier(ready):
+    svc, cid, _ = ready
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    m = r["metrics"]
+    t = m["timings_ms"]
+    assert set(t) == {"rewrite", "translate", "retrieve", "generate", "verify", "other"}
+    assert t["retrieve"] > 0 and t["generate"] > 0 and t["verify"] > 0
+    assert abs(sum(t.values()) - m["total_ms"]) <= 1  # the stages account for the whole request
+    # answer call (50 in / 20 out in the fake) + verifier judge call (5 / 5) are both counted
+    assert m["tokens_in"] == 55 and m["tokens_out"] == 25
+    stats = svc.logs.stats()["stages"]
+    assert stats["retrieve"]["runs"] == 1 and stats["verify"]["avg_ms"] > 0
+
+
+def test_stage_time_adds_up_when_a_stage_runs_twice(ready):
+    svc, cid, _ = ready
+    q = "Yıllık hastalık izni kaç gün?"  # refused once, translated, retrieved again
+    svc.llm.translations[q] = "How many sick leave days per year?"
+    r = ask(svc, cid, q)
+    log = svc.logs._c.find_one({"question": q})
+    assert r["metrics"]["timings_ms"]["translate"] > 0
+    assert log["node_ms"]["retrieve"] == r["metrics"]["timings_ms"]["retrieve"]
+
+
 def test_table_row_is_answerable(ready):
     svc, cid, _ = ready
     r = ask(svc, cid, "What is the hotel limit per night?")

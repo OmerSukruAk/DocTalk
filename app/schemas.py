@@ -36,9 +36,12 @@ class AnswerSegment(BaseModel):
 
 class AnswerMetrics(BaseModel):
     total_ms: int
-    tokens_in: int
+    tokens_in: int                     # all LLM calls: rewrite, translate, answer, verifier
     tokens_out: int
     cost_usd: float
+    # Wall time per stage: rewrite, translate, retrieve (embed + search + re-rank),
+    # generate (answer LLM), verify (rules + judge LLM), other (history, persistence, logging)
+    timings_ms: dict[str, float] = {}
 
 
 class AskRequest(BaseModel):

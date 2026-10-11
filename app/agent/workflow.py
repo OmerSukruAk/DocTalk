@@ -80,8 +80,10 @@ class GraphState(TypedDict, total=False):
 # --- graph nodes ---
 
 def _acc(state: GraphState, name: str, start: float, t_in: int = 0, t_out: int = 0, cost: float = 0.0) -> dict:
+    """Add this node's wall time and token use to the running totals. Times ADD UP: after a
+    retry or a translation, retrieve/generate/verify run twice and both runs count."""
     node_ms = dict(state.get("node_ms") or {})
-    node_ms[name] = round((time.perf_counter() - start) * 1000, 1)
+    node_ms[name] = round(node_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000, 1)
     return {
         "node_ms": node_ms,
         "tokens_in": (state.get("tokens_in") or 0) + t_in,
@@ -236,6 +238,7 @@ class Nodes:
             }
             for h in hits
         }
+        usage: dict = {}
         verdicts = await verify_claims(
             state.get("claims") or [],
             context_by_id=context_by_id,
@@ -243,12 +246,16 @@ class Nodes:
             llm=self.s.llm,
             nli_pass=self.s.settings.nli_pass,
             nli_fail=self.s.settings.nli_fail,
+            usage=usage,
         )
         judge_calls = sum(1 for v in verdicts if v.used_judge)
         return {
             "verdicts": verdicts,
             "judge_calls": (state.get("judge_calls") or 0) + judge_calls,
-            **_acc(state, "verify", start),
+            **_acc(
+                state, "verify", start,
+                usage.get("tokens_in", 0), usage.get("tokens_out", 0), usage.get("cost_usd", 0.0),
+            ),
         }
 
     # ---------------------------------------------------------- retry_prepare
@@ -572,5 +579,19 @@ async def answer_question(
             "tokens_in": final.get("tokens_in", 0),
             "tokens_out": final.get("tokens_out", 0),
             "cost_usd": round(final.get("cost_usd", 0.0), 6),
+            "timings_ms": stage_timings(final.get("node_ms") or {}, total_ms),
         },
     }
+
+
+# Stages in pipeline order. 'other' = loading history, saving messages and logs, graph overhead.
+STAGES = ("rewrite", "translate", "retrieve", "generate", "verify")
+
+
+def stage_timings(node_ms: dict, total_ms: float) -> dict:
+    """Per-stage wall time for the response: retrieve (embedding the question, keyword +
+    vector search, re-ranking), generate (the answer LLM call), verify (rule checks + the
+    judge LLM call). Stages that did not run are 0."""
+    out = {stage: round(float(node_ms.get(stage, 0.0)), 1) for stage in STAGES}
+    out["other"] = round(max(0.0, total_ms - sum(out.values())), 1)
+    return out

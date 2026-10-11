@@ -385,6 +385,7 @@ class LogRepo:
                     "errors": {"$sum": {"$cond": [{"$eq": ["$status", "error"]}, 1, 0]}},
                     "judge_calls": {"$sum": {"$ifNull": ["$judge_calls", 0]}},
                     "latencies": {"$push": "$total_ms"},
+                    "stages": {"$push": "$node_ms"},
                 }
             }
         ]
@@ -393,6 +394,7 @@ class LogRepo:
             return {
                 "requests": 0, "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "cost_usd": 0.0,
                 "refusal_rate": 0.0, "partial_rate": 0.0, "error_rate": 0.0, "judge_usage_rate": 0.0,
+                "stages": {},
             }
         row = rows[0]
         latencies = sorted(x for x in row.get("latencies", []) if isinstance(x, (int, float)))
@@ -407,7 +409,28 @@ class LogRepo:
             "partial_rate": round(row["partial"] / n, 3),
             "error_rate": round(row["errors"] / n, 3),
             "judge_usage_rate": round((row["judge_calls"] or 0) / n, 3),
+            "stages": _stage_stats(row.get("stages") or []),
         }
+
+
+def _stage_stats(node_ms_list: list) -> dict:
+    """Per-stage latency over the requests in which that stage ran:
+    {"retrieve": {"runs": 40, "avg_ms": 812.3, "p50_ms": 640.0, "p95_ms": 2100.5}, ...}"""
+    by_stage: dict[str, list[float]] = {}
+    for node_ms in node_ms_list:
+        for stage, ms in (node_ms or {}).items():
+            if isinstance(ms, (int, float)):
+                by_stage.setdefault(stage, []).append(float(ms))
+    out: dict[str, dict] = {}
+    for stage, values in by_stage.items():
+        values.sort()
+        out[stage] = {
+            "runs": len(values),
+            "avg_ms": round(sum(values) / len(values), 1),
+            "p50_ms": _percentile(values, 50),
+            "p95_ms": _percentile(values, 95),
+        }
+    return out
 
 
 def _percentile(values: list[float], pct: int) -> float:
