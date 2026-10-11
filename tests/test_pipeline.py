@@ -101,6 +101,11 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     r = ask(svc, cid, "How many sick leave days do I get?")
     assert r["status"] == "partial" and r["dropped_claims"] == 1
     assert all("99" not in s["text"] for s in r["segments"])
+    # the removed statement and why it was removed are reported, but never as part of the answer
+    removed = r["diagnostics"]["removed"]
+    assert [d["text"] for d in removed] == ["Sick leave is 99 days per year."]
+    assert removed[0]["reasons"] and removed[0]["checked_by"]
+    assert r["diagnostics"]["attempts"] == 1
 
 
 def test_invented_citation_id_is_rejected(ready):

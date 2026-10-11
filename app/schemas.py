@@ -44,6 +44,21 @@ class AnswerMetrics(BaseModel):
     timings_ms: dict[str, float] = {}
 
 
+class RemovedStatement(BaseModel):
+    """A statement the verifier removed: NOT supported by the documents, shown only as a warning."""
+    text: str
+    kind: Literal["fact", "insight", "gap"] = "fact"
+    reasons: list[str] = []
+    checked_by: str                    # rules | nli_fail | judge | judge_unavailable | gap
+
+
+class AnswerDiagnostics(BaseModel):
+    removed: list[RemovedStatement] = []
+    translated_query: str | None = None  # the question translated into the documents' language
+    attempts: int = 1                    # 2 = nothing verified at first, retried with a wider search
+    judge_calls: int = 0                 # statements the LLM judge had to decide
+
+
 class AskRequest(BaseModel):
     question: str
     style: str | None = None  # optional tone / format, e.g. "casual", "executive summary", "in Turkish"
@@ -60,6 +75,7 @@ class AskResponse(BaseModel):
     citations: list[Citation]
     dropped_claims: int = 0
     metrics: AnswerMetrics
+    diagnostics: AnswerDiagnostics = AnswerDiagnostics()
 
 
 class DocumentInfo(BaseModel):

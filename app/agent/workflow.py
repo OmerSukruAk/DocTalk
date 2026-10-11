@@ -540,9 +540,13 @@ async def answer_question(
     )
 
     dropped_reasons: list[str] = []
+    removed: list[dict] = []
     for verdict in final.get("verdicts", []) or []:
         if not verdict.ok:
-            dropped_reasons.extend(verdict.reasons or [verdict.stage_decided])
+            reasons = verdict.reasons or [verdict.stage_decided]
+            dropped_reasons.extend(reasons)
+            removed.append({"text": verdict.claim.text, "kind": verdict.claim.kind, "reasons": reasons,
+                            "checked_by": verdict.stage_decided})
 
     await asyncio.to_thread(
         services.request_logger.log,
@@ -580,6 +584,13 @@ async def answer_question(
             "tokens_out": final.get("tokens_out", 0),
             "cost_usd": round(final.get("cost_usd", 0.0), 6),
             "timings_ms": stage_timings(final.get("node_ms") or {}, total_ms),
+        },
+        # Response only (not stored with the message): removed statements are unverified text.
+        "diagnostics": {
+            "removed": removed,
+            "translated_query": final.get("search_query") if final.get("translated") else None,
+            "attempts": (final.get("attempt") or 0) + 1,
+            "judge_calls": final.get("judge_calls", 0),
         },
     }
 
