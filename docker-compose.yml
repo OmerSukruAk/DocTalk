@@ -1,10 +1,19 @@
-# docker compose up --build   ->   API on http://localhost:8000/docs
+# docker compose up --build   ->   UI on http://localhost:8050, API on http://localhost:8000/docs
+# Two app containers: `api` (backend, built from ./Dockerfile) and `frontend` (UI, built from
+# ./frontend/Dockerfile). The frontend gets no .env and reaches the API over HTTP only.
 services:
   api:
     build: .
     env_file: .env
     ports: ["8000:8000"]
     depends_on: [mongo, qdrant, dev-issuer]
+  frontend:
+    build: ./frontend
+    environment:
+      API_URL: http://api:8000
+      ISSUER_URL: http://dev-issuer:9000   # empty when AUTH_MODE=entra: the UI then asks for a token
+    ports: ["8050:8050"]
+    depends_on: [api]
   mongo:
     image: mongo:7
     volumes: ["mongo:/data/db"]
