@@ -1,9 +1,9 @@
 # Governance checklist – DocTalk
 
-Draft entry for a data catalogue (e.g. Collibra) and the controls and open items a data-governance
-review would ask about.
+A draft Collibra asset entry for DocTalk, and the controls and open items a data-governance review
+would ask about.
 
-## Asset entry (draft)
+## Collibra asset entry (draft)
 
 | Field | Value |
 |---|---|
