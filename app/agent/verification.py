@@ -154,6 +154,10 @@ class NLIScorer:
                 return False
         return True
 
+    def warm_up(self) -> None:
+        """Load the model now (called at startup) so the first question does not pay for it."""
+        self._ensure_loaded()
+
     def entailment_score(self, premise: str, hypothesis: str) -> float | None:
         if not self._ensure_loaded():
             return None
