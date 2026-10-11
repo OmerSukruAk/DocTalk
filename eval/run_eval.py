@@ -65,13 +65,18 @@ def evaluate(client: httpx.Client, dataset: list[dict], conversation_id: str | N
             p = client.get(f"/v1/passages/{c['sentence_id']}", params={"context": 0})
             valid.append(p.status_code == 200 and p.json()["citation"]["text"] == c["text"])
 
-        # groundedness: each segment cited + numbers appear in cited text
+        # groundedness: each fact/insight segment is cited; every number in a FACT appears in its
+        # cited text (insights may contain derived numbers, e.g. a computed difference; 'gap'
+        # notes state what is missing and carry no citations)
         seg_ok = []
         for seg in resp.get("segments", []):
+            kind = seg.get("kind", "fact")
+            if kind == "gap":
+                continue
             cited_text = " ".join(cites[n]["text"] for n in seg["citations"] if n in cites)
             nums = {_norm_num(n) for n in NUM.findall(seg["text"])}
             src = {_norm_num(n) for n in NUM.findall(cited_text)}
-            seg_ok.append(bool(seg["citations"]) and nums <= src)
+            seg_ok.append(bool(seg["citations"]) and (kind == "insight" or nums <= src))
 
         low = text.lower()
         acc = None

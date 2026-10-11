@@ -170,26 +170,64 @@ class NLIScorer:
 
 # --- LLM judge ---
 
-async def judge_claim(
+_VERDICT_RE = re.compile(r'"id"\s*:\s*"?(\d+)"?\s*,\s*"label"\s*:\s*"(supported|unsupported)"', re.IGNORECASE)
+
+def _judge_block(n: int, claim: "Claim", cited_sources: list[dict]) -> str:
+    return (
+        f"### Segment {n} (kind: {claim.kind})\n{claim.text}\n"
+        f"Cited sources:\n{build_sources_block(cited_sources)}"
+    )
+
+
+async def judge_claims(
     llm: ChatClient,
-    claim_text: str,
-    cited_sources: list[dict],
-) -> tuple[bool, str]:
-    """Return (supported, reason). Any non-'supported' label is treated as fail."""
+    items: list[tuple["Claim", list[dict]]],
+    usage_out: dict | None = None,
+) -> list[tuple[bool, str]]:
+    """Judge every pending segment in ONE call. Returns (supported, reason) per item, in order.
+    Anything without an explicit 'supported' verdict fails (fail closed). The judge call's
+    tokens and cost are added to ``usage_out`` so the request's cost metrics include them."""
+    if not items:
+        return []
     if not llm.configured:
-        # No judge available -> be conservative and fail the claim.
-        return False, "judge unavailable (LLM not configured)"
-    sources = build_sources_block(cited_sources)
+        return [(False, "judge unavailable (LLM not configured)")] * len(items)
+    body = "\n\n".join(_judge_block(i + 1, claim, sources) for i, (claim, sources) in enumerate(items))
     try:
-        data, _usage = await llm.complete_json(
-            JUDGE_SYSTEM, JUDGE_USER.format(sources=sources, claim=claim_text), max_tokens=256
+        # Generous budget: reasoning models (e.g. deepseek-flash) spend part of max_tokens on
+        # hidden reasoning, and a truncated reply would fail every claim.
+        data, usage = await llm.complete_json(
+            JUDGE_SYSTEM, JUDGE_USER.format(segments=body), max_tokens=1500 + 120 * len(items)
         )
     except Exception as exc:  # provider outage must not crash the request: fail closed
         logger.warning("LLM judge failed: %s", exc)
-        return False, f"judge unavailable ({type(exc).__name__})"
-    label = str(data.get("label", "")).strip().lower()
-    reason = str(data.get("reason", ""))[:300]
-    return label == "supported", (reason or label or "unsupported")
+        return [(False, f"judge unavailable ({type(exc).__name__})")] * len(items)
+    if usage_out is not None:
+        for key in ("tokens_in", "tokens_out", "cost_usd"):
+            usage_out[key] = usage_out.get(key, 0) + (getattr(usage, key, 0) or 0)
+
+    by_id: dict[int, tuple[str, str]] = {}
+    if not data.get("verdicts") and getattr(usage, "text", ""):
+        # Truncated JSON: keep every verdict that was written completely.
+        for m in _VERDICT_RE.finditer(usage.text):
+            by_id[int(m.group(1))] = (m.group(2).lower(), "")
+    for raw in data.get("verdicts") or []:
+        try:
+            by_id[int(raw.get("id"))] = (str(raw.get("label", "")).strip().lower(), str(raw.get("reason", ""))[:300])
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if not by_id and "label" in data and len(items) == 1:  # single-verdict shape
+        by_id[1] = (str(data.get("label", "")).strip().lower(), str(data.get("reason", ""))[:300])
+
+    out: list[tuple[bool, str]] = []
+    for i in range(len(items)):
+        label, reason = by_id.get(i + 1, ("", "judge returned no verdict"))
+        out.append((label == "supported", reason or label or "unsupported"))
+    return out
+
+
+async def judge_claim(llm: ChatClient, claim_text: str, cited_sources: list[dict]) -> tuple[bool, str]:
+    """Single-claim convenience wrapper around ``judge_claims``."""
+    return (await judge_claims(llm, [(Claim(text=claim_text), cited_sources)]))[0]
 
 
 # --- pipeline ---
@@ -198,19 +236,24 @@ async def judge_claim(
 class Claim:
     text: str
     citations: list[str] = field(default_factory=list)
+    kind: str = "fact"  # fact | insight | gap
+    format: str = "text"  # paragraph | bullet | text
 
 
 @dataclass
 class ClaimVerdict:
     claim: Claim
     ok: bool
-    stage_decided: str  # rules | nli | nli_fail | judge | judge_unavailable
+    stage_decided: str  # rules | nli | nli_fail | judge | judge_unavailable | gap
     reasons: list[str] = field(default_factory=list)
     nli_score: float | None = None
 
     @property
     def used_judge(self) -> bool:
         return self.stage_decided.startswith("judge")
+
+
+_MAX_GAP_WORDS = 40
 
 
 async def verify_claims(
@@ -221,17 +264,38 @@ async def verify_claims(
     llm: ChatClient,
     nli_pass: float,
     nli_fail: float,
+    usage: dict | None = None,
 ) -> list[ClaimVerdict]:
     """Layered verification, cheapest first:
-    hard rules (never overridable) -> local NLI -> LLM judge for borderline only."""
-    verdicts: list[ClaimVerdict] = []
+    hard rules (never overridable) -> local NLI (facts only) -> ONE batched LLM judge call
+    for everything still undecided.
+
+    * fact    - must be stated by its cited sources (paraphrase allowed); numbers and
+                negations are checked deterministically.
+    * insight - the model's own commentary; must be grounded in (and cite) the sources, but
+                may contain derived numbers (a calculation), so only the judge decides.
+    * gap     - 'the documents do not cover X': carries no facts and no citations; kept
+                when short."""
+    verdicts: list[ClaimVerdict | None] = []
+    pending: list[tuple[int, Claim, list[dict], float | None]] = []
     allowed_ids = set(context_by_id)
 
     for claim in claims:
+        if claim.kind == "gap":
+            short = len(claim.text.split()) <= _MAX_GAP_WORDS
+            claim.citations = []
+            verdicts.append(
+                ClaimVerdict(claim=claim, ok=short, stage_decided="gap", reasons=[] if short else ["gap note too long"])
+            )
+            continue
+
         cited_sources = [context_by_id[c] for c in claim.citations if c in context_by_id]
         source_texts = [s["text"] for s in cited_sources]
 
-        rule_results = run_rules(claim.citations, claim.text, source_texts, allowed_ids)
+        if claim.kind == "insight":
+            rule_results = [check_citations_exist(claim.citations, allowed_ids)]
+        else:
+            rule_results = run_rules(claim.citations, claim.text, source_texts, allowed_ids)
         failed = [r for r in rule_results if not r.ok]
         if failed:
             verdicts.append(
@@ -245,38 +309,39 @@ async def verify_claims(
             continue
 
         score = None
-        if nli.configured and cited_sources:
+        if claim.kind == "fact" and nli.configured and cited_sources:
             # torch inference is CPU-bound: keep it off the event loop
             score = await asyncio.to_thread(nli.entailment_score, " ".join(source_texts), claim.text)
 
-        scrutiny = needs_scrutiny(claim.text, source_texts)
-        if score is not None and score >= nli_pass and not scrutiny:
-            verdicts.append(
-                ClaimVerdict(claim=claim, ok=True, stage_decided="nli", nli_score=score)
-            )
-            continue
-        if score is not None and score <= nli_fail:
-            verdicts.append(
-                ClaimVerdict(
-                    claim=claim,
-                    ok=False,
-                    stage_decided="nli_fail",
-                    reasons=[f"NLI entailment {score:.2f} <= {nli_fail}"],
-                    nli_score=score,
+        if score is not None:
+            scrutiny = needs_scrutiny(claim.text, source_texts)
+            if score >= nli_pass and not scrutiny:
+                verdicts.append(ClaimVerdict(claim=claim, ok=True, stage_decided="nli", nli_score=score))
+                continue
+            if score <= nli_fail:
+                verdicts.append(
+                    ClaimVerdict(
+                        claim=claim,
+                        ok=False,
+                        stage_decided="nli_fail",
+                        reasons=[f"NLI entailment {score:.2f} <= {nli_fail}"],
+                        nli_score=score,
+                    )
                 )
-            )
-            continue
+                continue
 
-        # borderline (or NLI unavailable) -> LLM judge
-        supported, reason = await judge_claim(llm, claim.text, cited_sources)
-        verdicts.append(
-            ClaimVerdict(
-                claim=claim,
-                ok=supported,
-                stage_decided="judge" if llm.configured and not reason.startswith("judge unavailable") else "judge_unavailable",
-                reasons=[] if supported else [reason],
-                nli_score=score,
-            )
+        # borderline, an insight, or NLI unavailable -> batched LLM judge
+        pending.append((len(verdicts), claim, cited_sources, score))
+        verdicts.append(None)
+
+    results = await judge_claims(llm, [(claim, sources) for _, claim, sources, _ in pending], usage)
+    for (slot, claim, _sources, score), (supported, reason) in zip(pending, results):
+        unavailable = reason.startswith("judge unavailable")
+        verdicts[slot] = ClaimVerdict(
+            claim=claim,
+            ok=supported,
+            stage_decided="judge_unavailable" if unavailable else "judge",
+            reasons=[] if supported else [reason],
+            nli_score=score,
         )
-
-    return verdicts
+    return [v for v in verdicts if v is not None]

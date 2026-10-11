@@ -72,11 +72,15 @@ class FakeLLM:
         self.calls: list[tuple[str, str]] = []
         self.fail = False
         self.extra_claims: list[dict] = []  # injected 'hallucinated' claims
+        self.translations: dict[str, str] = {}  # question -> 'translated' search query
 
     async def chat(self, system, user, **kw):
         self.calls.append(("chat", user))
         if self.fail:
             raise RuntimeError("503 from provider")
+        if "Section titles of the documents:" in user:  # cross-language search fallback
+            q = user.split("Question:")[1].split("\n")[0].strip()
+            return ChatResult(self.translations.get(q, q), 10, 5, 0.0)
         q = user.split("Latest question:")[1].split("\n")[0].strip()
         return ChatResult(f"standalone: {q}", 10, 5, 0.0)
 
@@ -84,17 +88,24 @@ class FakeLLM:
         self.calls.append(("json", user))
         if self.fail:
             raise RuntimeError("503 from provider")
-        if "entailment judge" in system:
-            return {"label": "supported", "reason": "ok"}, ChatResult("", 5, 5, 0.0)
-        blocks = re.findall(r"<<<SOURCE id=(\S+) doc=.*?>>>\n(.*?)\n<<<END SOURCE>>>", user, re.S)
-        question = user.split("Question:")[-1].split("JSON answer:")[0]
+        if "check each segment" in system:
+            n = len(re.findall(r"^### Segment \d+", user, re.M))
+            verdicts = [{"id": i + 1, "label": "supported", "reason": "ok"} for i in range(n)]
+            return {"verdicts": verdicts}, ChatResult("", 5, 5, 0.0)
+        blocks = re.findall(r"^\[(\S+?)\] (.*)$", user.split("Sources:")[-1], re.M)
+        question = user.split("User's message:")[-1].split("JSON answer:")[0]
+        first_line = question.strip().split("\n")[0].strip()
+        question += " " + self.translations.get(first_line, "")  # a real model reads any language
         q = set(_terms(question))
         scored = sorted(
             ((len(q & set(_terms(text))), sid, text) for sid, text in blocks), reverse=True
         )
-        claims = [{"text": text, "citations": [sid]} for n, sid, text in scored[:1] if n >= 2 or (n == 1 and len(q) <= 2)]
-        claims += self.extra_claims
-        return {"claims": claims}, ChatResult("", 50, 20, 0.0)
+        segments = [
+            {"text": text, "kind": "fact", "format": "text", "citations": [sid]}
+            for n, sid, text in scored[:1] if n >= 2 or (n == 1 and len(q) <= 2)
+        ]
+        segments += self.extra_claims
+        return {"segments": segments}, ChatResult("", 50, 20, 0.0)
 
 
 class InMemoryFileStore:

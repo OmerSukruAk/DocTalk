@@ -47,6 +47,29 @@ def test_offtopic_question_is_stopped_by_the_gate_with_zero_llm_tokens(ready):
     assert r["metrics"]["tokens_in"] == 0 and len(svc.llm.calls) == before
 
 
+def test_foreign_language_question_is_translated_once_then_answered(ready):
+    svc, cid, _ = ready
+    q = "Yıllık hastalık izni kaç gün?"  # Turkish: shares no keyword with the English policy
+    svc.llm.translations[q] = "How many sick leave days per year?"
+    r = ask(svc, cid, q)
+    assert r["status"] == "ok" and any("Sick leave is 10 days" in c["text"] for c in r["citations"])
+
+
+def test_foreign_offtopic_question_is_still_refused(ready):
+    svc, cid, _ = ready
+    r = ask(svc, cid, "Fransa'nın başkenti neresi?")  # translation (identity here) finds nothing
+    assert r["status"] == "refused"
+
+
+def test_overview_question_answers_from_the_whole_document(ready):
+    svc, cid, _ = ready
+    r = ask(svc, cid, "Summarise the document")
+    assert r["status"] != "refused" or r["refusal_reason"] != "no relevant content found in your documents"
+    generate = [u for kind, u in svc.llm.calls if kind == "json" and "User's message:" in u][-1]
+    for section in ("Annual Leave", "Sick Leave", "Remote Work", "Expenses"):
+        assert section in generate  # every section reached the model, not one similarity hit
+
+
 def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     svc, cid, _ = ready
     sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
@@ -68,8 +91,12 @@ def test_followup_is_generated_against_the_rewritten_question(ready):
     ask(svc, cid, "How many sick leave days do I get?")
     r = ask(svc, cid, "And remote work?")
     assert r["rewritten_question"] == "standalone: And remote work?"
-    last_generate = [u for kind, u in svc.llm.calls if kind == "json" and "Question:" in u][-1]
-    assert "Question: standalone: And remote work?" in last_generate
+    last_generate = [u for kind, u in svc.llm.calls if kind == "json" and "User's message:" in u][-1]
+    # the model sees the user's own words (tone instructions live there) AND the resolved question
+    assert "User's message: And remote work?" in last_generate
+    assert "(Standalone version: standalone: And remote work?)" in last_generate
+    # ...and the conversation so far, so 'make it shorter' / 'and X?' have context
+    assert "How many sick leave days do I get?" in last_generate.split("Sources:")[0]
 
 
 def test_llm_outage_returns_explicit_error_and_persists_both_messages(ready):

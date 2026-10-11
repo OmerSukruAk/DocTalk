@@ -20,8 +20,15 @@ DEMO_QUESTIONS = [
     "What is the hotel limit per night?",
     "And meals?",                                    # follow-up: resolved from conversation history
     "Can I work remotely from another country?",     # negation-sensitive
+    "Summarise the documents in three bullet points for a new employee.",  # overview + tone
     "What is the capital of France?",                # not in the documents -> must refuse
 ]
+
+
+def _seg_line(seg: dict) -> str:
+    marks = "".join(f"[{n}]" for n in seg["citations"])
+    note = " (analysis)" if seg.get("kind") == "insight" else ""
+    return f"{seg['text']}{marks}{note}"
 
 
 def render(resp: dict) -> None:
@@ -29,10 +36,23 @@ def render(resp: dict) -> None:
     if status in ("refused", "error"):
         print(f"  [{status.upper()}] {resp.get('refusal_reason')}")
     else:
+        line = ""
         for seg in resp["segments"]:
-            print(textwrap.fill(f"{seg['text']} {''.join(f'[{n}]' for n in seg['citations'])}", 100, initial_indent="  ", subsequent_indent="  "))
+            fmt = seg.get("format", "text")
+            if fmt == "bullet" or (fmt == "paragraph" and line):
+                if line:
+                    print(textwrap.fill(line, 100, initial_indent="  ", subsequent_indent="  "))
+                    if fmt == "paragraph":
+                        print()
+                line = ""
+            if fmt == "bullet":
+                print(textwrap.fill(_seg_line(seg), 100, initial_indent="  - ", subsequent_indent="    "))
+            else:
+                line = f"{line} {_seg_line(seg)}".strip()
+        if line:
+            print(textwrap.fill(line, 100, initial_indent="  ", subsequent_indent="  "))
         if status == "partial":
-            print(f"  (note: {resp['dropped_claims']} unsupported claim(s) were removed by the verifier)")
+            print(f"  (note: {resp['dropped_claims']} unsupported statement(s) were removed by the verifier)")
     for c in resp["citations"]:
         loc = c["location"]
         where = f"p.{loc['page']}" if loc.get("page") else (loc.get("heading") or "")
@@ -50,6 +70,7 @@ def main() -> int:
     ap.add_argument("--issuer", default="http://localhost:9000")
     ap.add_argument("--user", default="alice")
     ap.add_argument("--token")
+    ap.add_argument("--style", help='answer tone/format, e.g. "casual", "executive summary", "in Turkish"')
     a = ap.parse_args()
 
     token = a.token or httpx.post(f"{a.issuer}/token", params={"user": a.user}).json()["access_token"]
@@ -68,12 +89,23 @@ def main() -> int:
     for d in r.json():
         print(f"  {d['name']}: {d['sentence_count']} citable sentences (id {d['id']})")
 
-    ask = lambda q: c.post(f"/v1/conversations/{cid}/messages", json={"question": q}).json()
+    style: str | None = a.style
+
+    def ask(q: str) -> dict:
+        r = c.post(f"/v1/conversations/{cid}/messages", json={"question": q, "style": style})
+        r.raise_for_status()
+        return r.json()
 
     print("\n== 2. Ask ==")
+    if a.mode == "chat":
+        print("  (type 'exit' to quit, '/style <tone or format>' to change the answer style, '/style' to reset)")
     questions = DEMO_QUESTIONS if a.mode == "demo" else iter(lambda: input("you> ").strip(), "exit")
     for q in questions:
         if not q:
+            continue
+        if q.startswith("/style"):
+            style = q[len("/style"):].strip() or None
+            print(f"  style: {style or 'default'}\n")
             continue
         print(f"Q: {q}")
         render(ask(q))

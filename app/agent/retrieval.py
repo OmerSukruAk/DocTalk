@@ -38,6 +38,14 @@ def _tokenize(text: str) -> list[str]:
     return _TOKEN.findall(text.lower())
 
 
+def looks_foreign(text: str) -> bool:
+    """True when a question is probably not English/Czech: none of its words are EN/CS
+    function words ('what', 'is', 'the', 'je', 'co'...). Such a question may share no
+    keywords with the documents, so it deserves one translation attempt before refusal."""
+    tokens = _tokenize(text)
+    return bool(tokens) and not any(t in STOPWORDS and len(t) > 1 for t in tokens)
+
+
 def content_terms(text: str) -> list[str]:
     """Query words that actually carry meaning (no stopwords, no 1-char tokens)."""
     return [t for t in _tokenize(text) if t not in STOPWORDS and len(t) > 1]
