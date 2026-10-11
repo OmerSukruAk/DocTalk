@@ -31,10 +31,11 @@ class ReRanker:
         self._model = None
         self._raw_logits = False
         self._lock = threading.Lock()
+        self._load_failed = False
 
     @property
     def configured(self) -> bool:
-        return bool(self._model_name)
+        return bool(self._model_name) and not self._load_failed
 
     def candidates(self, top_k: int) -> int:
         """How many chunks to propose before re-ranking (must be >= top_k)."""
@@ -48,9 +49,14 @@ class ReRanker:
     def _load(self):
         with self._lock:  # a question arriving during the startup warm-up waits for it
             if self._model is None:
-                from sentence_transformers import CrossEncoder
+                try:
+                    from sentence_transformers import CrossEncoder
 
-                model = CrossEncoder(self._model_name)
+                    model = CrossEncoder(self._model_name)
+                except Exception:
+                    # e.g. no network or an unwritable model cache: search keeps the fused order
+                    self._load_failed = True
+                    raise
                 # Many cross-encoders (e.g. ms-marco-MiniLM) ship with an Identity activation and
                 # return raw logits (-11 .. +10). The gate threshold is a probability, so convert.
                 act = getattr(model, "activation_fn", None) or getattr(

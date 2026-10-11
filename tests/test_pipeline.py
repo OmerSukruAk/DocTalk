@@ -174,6 +174,24 @@ def test_users_are_isolated(ready):
     assert r["status"] == "refused" and r["citations"] == []
 
 
+def test_reranker_that_cannot_load_falls_back_to_the_fused_order(ready):
+    svc, cid, _ = ready
+
+    class BrokenReRanker:
+        configured = True
+
+        def candidates(self, top_k):
+            return top_k * 2
+
+        def rerank(self, query, chunks, top_k):
+            raise PermissionError("model cache not writable")
+
+    svc.reranker = BrokenReRanker()
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    assert r["status"] in ("ok", "partial") and r["citations"]
+    assert r["diagnostics"]["search"]["reranked"] is False
+
+
 def test_bm25_only_degraded_mode_still_answers_and_gates(settings, services, hr_doc):
     class Off:
         configured = False
