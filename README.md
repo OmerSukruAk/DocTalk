@@ -136,8 +136,11 @@ refused. Thresholds are the `GATE_MIN_*` settings in `.env`; tune them with `eva
 - Citations as numbered pills: hover to preview the sentence, click to open the document. A PDF opens
   at the cited page with the sentence highlighted; DOCX and Markdown show the sentence within its
   section.
-- Insights are tinted, refusals and removed statements are clearly marked, and each answer shows its
-  time, tokens and cost.
+- Insights are tinted, and refusals and removed statements are clearly marked.
+- *Answer details* under each answer (can be switched off in the settings): the verification status;
+  warnings, such as each statement the verifier removed and why, a retry or a translation; then the
+  pipeline step by step (understanding the question, searching, writing, fact-checking) with the
+  time each step took, tokens in and out, and cost.
 - Optional answer style ("casual", "executive summary", "in Turkish"); light and dark mode; works on
   phones.
 
