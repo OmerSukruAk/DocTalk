@@ -69,6 +69,7 @@ def test_offtopic_question_is_stopped_by_the_gate_with_zero_llm_tokens(ready):
     r = ask(svc, cid, "What is the capital of France?")
     assert r["status"] == "refused" and "no relevant content" in r["refusal_reason"]
     assert r["metrics"]["tokens_in"] == 0 and len(svc.llm.calls) == before
+    assert r["diagnostics"]["search"]["gate_passed"] is False
 
 
 def test_foreign_language_question_is_translated_once_then_answered(ready):
@@ -106,6 +107,10 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     assert [d["text"] for d in removed] == ["Sick leave is 99 days per year."]
     assert removed[0]["reasons"] and removed[0]["checked_by"]
     assert r["diagnostics"]["attempts"] == 1
+    # the search funnel and who decided each statement are reported too
+    search = r["diagnostics"]["search"]
+    assert search["kept_chunks"] > 0 and search["sentences"] > 0 and search["gate_passed"] is True
+    assert r["diagnostics"]["verification"]["rules"]["removed"] == {"fact": 1}
 
 
 def test_invented_citation_id_is_rejected(ready):

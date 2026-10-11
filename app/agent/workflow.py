@@ -587,12 +587,45 @@ async def answer_question(
         },
         # Response only (not stored with the message): removed statements are unverified text.
         "diagnostics": {
+            "search": search_stats(final),
+            "verification": verification_counts(final.get("verdicts") or []),
             "removed": removed,
             "translated_query": final.get("search_query") if final.get("translated") else None,
             "attempts": (final.get("attempt") or 0) + 1,
             "judge_calls": final.get("judge_calls", 0),
         },
     }
+
+
+def search_stats(final: dict) -> dict | None:
+    """The retrieval funnel of the last attempt, for the answer's diagnostics."""
+    s = final.get("signals")
+    if s is None:
+        return None
+    hits = final.get("hits") or []
+    mode = "overview" if s.overview else ("hybrid" if s.vector_top is not None else "keyword")
+    return {
+        "mode": mode, "top_k": final.get("top_k") or 0,
+        "keyword_found": s.keyword_found, "vector_found": s.vector_found, "merged": s.merged,
+        "candidates": s.candidates, "reranked": s.reranked, "kept_chunks": s.kept_chunks,
+        "sentences": sum(1 for h in hits if not h.is_context),
+        "context_sentences": sum(1 for h in hits if h.is_context),
+        "gate_passed": final.get("relevant"),
+        "vector_top": s.vector_top, "rerank_top": s.rerank_top, "lexical_top": s.lexical_top,
+    }
+
+
+_DECIDED_BY = {"nli_fail": "nli"}  # NLI keeps ("nli") and removes ("nli_fail"): one check
+
+
+def verification_counts(verdicts: list) -> dict:
+    """Per check, how many statements of each kind it kept and removed (last attempt)."""
+    out: dict[str, dict] = {}
+    for v in verdicts:
+        check = out.setdefault(_DECIDED_BY.get(v.stage_decided, v.stage_decided), {"kept": {}, "removed": {}})
+        bucket = check["kept" if v.ok else "removed"]
+        bucket[v.claim.kind] = bucket.get(v.claim.kind, 0) + 1
+    return out
 
 
 # Stages in pipeline order. 'other' = loading history, saving messages and logs, graph overhead.
