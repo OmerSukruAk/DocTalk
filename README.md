@@ -20,7 +20,7 @@ the documents don't contain the answer, DocTalk says so instead of guessing.
 | **Stretch:** observability | Latency per stage, tokens and cost on every answer; admin stats; evaluation harness |
 | Demo script | [`docs/demo_script.md`](docs/demo_script.md) |
 | Evaluation report | `python eval/run_eval.py` writes `eval/report.md` (needs a real LLM key, see [Evaluation](#evaluation)) |
-| Governance checklist | [`docs/governance_checklist.md`](docs/governance_checklist.md) |
+| Governance checklist (Collibra entry draft) | [`docs/governance_checklist.md`](docs/governance_checklist.md) |
 
 ## Quickstart (about 5 minutes)
 
@@ -234,5 +234,5 @@ eval/         evaluation harness, 17-question dataset, sample documents
 scripts/      command-line client
 dev_issuer/   local stand-in for Entra ID (demo only)
 infra/        Azure Container Apps deployment script (API + web UI)
-docs/         demo script, governance checklist, presentation outline
+docs/         demo script, governance checklist (with a Collibra entry draft)
 ```
