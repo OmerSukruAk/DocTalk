@@ -69,6 +69,26 @@ def check_numbers(claim_text: str, source_texts: list[str]) -> RuleResult:
     return RuleResult(True)
 
 
+def sources_for_repeated_numbers(
+    claim_text: str, source_texts: list[str], answer_sources: dict[str, dict]
+) -> dict[str, dict]:
+    """A statement may repeat a number another statement of the same answer cited ('Mercury
+    averages far below Venus's 465 °C'). Returns those other sources when they hold every number
+    missing from the statement's own sources; otherwise {} and the number rule decides."""
+    own: set[str] = set()
+    for text in source_texts:
+        own |= extract_numbers(text)
+    missing = extract_numbers(claim_text) - own
+    if not missing:
+        return {}
+    found, covered = {}, set()
+    for sid, source in answer_sources.items():
+        hit = missing & extract_numbers(source["text"])
+        if hit:
+            found[sid], covered = source, covered | hit
+    return found if covered == missing else {}
+
+
 def _has_negation(text_low: str) -> bool:
     return any(_contains_word(text_low, w) for w in _NEGATIONS)
 
@@ -299,7 +319,9 @@ async def verify_claims(
     for everything still undecided.
 
     * fact    - must be stated by its cited sources (paraphrase allowed); numbers and
-                negations are checked deterministically.
+                negations are checked deterministically. A number repeated from a source
+                another statement of the answer cites is not invented: that source is added
+                to the statement's citations and the judge decides.
     * insight - the model's own commentary; must be grounded in (and cite) the sources, but
                 may contain derived numbers (a calculation), so only the judge decides.
     * gap     - 'the documents do not cover X': carries no facts and no citations; kept
@@ -311,6 +333,11 @@ async def verify_claims(
     allowed_ids = set(context_by_id)
 
     context_texts = [c["text"] for c in context_by_id.values()]
+    answer_sources = {
+        cid: context_by_id[cid]
+        for c in claims if c.kind in ("fact", "insight")
+        for cid in c.citations if cid in context_by_id
+    }
     for claim in claims:
         if claim.kind == "framing":
             claim.citations = []
@@ -327,6 +354,12 @@ async def verify_claims(
 
         cited_sources = [context_by_id[c] for c in claim.citations if c in context_by_id]
         source_texts = [s["text"] for s in cited_sources]
+        borrowed = {}
+        if claim.kind == "fact" and cited_sources:
+            borrowed = sources_for_repeated_numbers(claim.text, source_texts, answer_sources)
+            claim.citations = [*claim.citations, *borrowed]
+            cited_sources += borrowed.values()
+            source_texts += [s["text"] for s in borrowed.values()]
 
         if claim.kind == "insight":
             rule_results = [check_citations_exist(claim.citations, allowed_ids)]
@@ -345,7 +378,7 @@ async def verify_claims(
             continue
 
         score = None
-        if claim.kind == "fact" and nli.configured and cited_sources:
+        if claim.kind == "fact" and nli.configured and cited_sources and not borrowed:  # a comparison: judge
             # torch inference is CPU-bound: keep it off the event loop
             score = await asyncio.to_thread(nli.entailment_score, " ".join(source_texts), claim.text)
 
