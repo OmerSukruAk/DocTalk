@@ -26,7 +26,7 @@ def _make_pdf(path):
 def test_pdf_headings_running_headers_and_reading_order(tmp_path):
     p = tmp_path / "policy.pdf"
     _make_pdf(str(p))
-    blocks = parse(str(p))
+    blocks = parse("policy.pdf", p.read_bytes())
     texts = [b.text for b in blocks]
     assert not any("Confidential" in t or t.startswith("Page ") for t in texts), texts
     sick = next(b for b in blocks if "Sick leave is 10" in b.text)

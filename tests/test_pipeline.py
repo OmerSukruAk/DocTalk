@@ -17,8 +17,9 @@ def ask(services, cid, q, owner=OWNER):
 
 @pytest.fixture()
 def ready(services, hr_doc):
-    info = asyncio.run(services.ingestion.ingest(OWNER, "hr.md", hr_doc))
-    return services, services.conversations.create(OWNER), info
+    cid = services.conversations.create(OWNER)
+    info = asyncio.run(services.ingestion.ingest(OWNER, cid, "hr.md", hr_doc))
+    return services, cid, info
 
 
 def test_grounded_answer_has_verifiable_citation(ready):
@@ -94,8 +95,8 @@ def test_bm25_only_degraded_mode_still_answers_and_gates(settings, services, hr_
 
     services.embeddings = Off()
     services.ingestion._embeddings = Off()
-    asyncio.run(services.ingestion.ingest("tid:carol", "hr.md", hr_doc))
     cid = services.conversations.create("tid:carol")
+    asyncio.run(services.ingestion.ingest("tid:carol", cid, "hr.md", hr_doc))
     ok = ask(services, cid, "sick leave days", owner="tid:carol")
     assert ok["status"] == "ok"
     generations = sum(1 for k, u in services.llm.calls if k == "json" and "Question:" in u)
@@ -108,30 +109,33 @@ def test_bm25_only_degraded_mode_still_answers_and_gates(settings, services, hr_
 def test_reupload_is_idempotent_and_limit_is_enforced(services, hr_doc):
     from app.agent.ingestion import IngestionError
 
-    a = asyncio.run(services.ingestion.ingest(OWNER, "hr.md", hr_doc))
-    b = asyncio.run(services.ingestion.ingest(OWNER, "hr-copy.md", hr_doc))
+    cid = services.conversations.create(OWNER)
+    a = asyncio.run(services.ingestion.ingest(OWNER, cid, "hr.md", hr_doc))
+    b = asyncio.run(services.ingestion.ingest(OWNER, cid, "hr-copy.md", hr_doc))
     assert a["id"] == b["id"]
     for i in range(4):
-        asyncio.run(services.ingestion.ingest(OWNER, f"d{i}.md", f"# T{i}\n\nUnique text number {i}.".encode()))
+        asyncio.run(services.ingestion.ingest(OWNER, cid, f"d{i}.md", f"# T{i}\n\nUnique text number {i}.".encode()))
     with pytest.raises(IngestionError, match="limit"):
-        asyncio.run(services.ingestion.ingest(OWNER, "d9.md", b"# X\n\nOne more document."))
+        asyncio.run(services.ingestion.ingest(OWNER, cid, "d9.md", b"# X\n\nOne more document."))
 
 
 def test_corrupt_pdf_is_a_clean_user_error(services):
     from app.agent.ingestion import IngestionError
 
+    cid = services.conversations.create(OWNER)
     with pytest.raises(IngestionError, match="could not parse"):
-        asyncio.run(services.ingestion.ingest(OWNER, "bad.pdf", b"%PDF-1.4 not really"))
-    assert services.documents.count(OWNER) == 0  # rolled back
+        asyncio.run(services.ingestion.ingest(OWNER, cid, "bad.pdf", b"%PDF-1.4 not really"))
+    assert services.documents.count(OWNER, cid) == 0  # rolled back
 
 
 def test_bm25_picks_up_documents_added_by_another_replica(services, hr_doc):
     """Simulates replica B: the chunk set changes without THIS process calling invalidate()."""
-    asyncio.run(services.ingestion.ingest(OWNER, "hr.md", hr_doc))
-    assert services.bm25.search(OWNER, "sick leave", 3)
-    assert not services.bm25.search(OWNER, "onboarding buddy", 3)
+    cid = services.conversations.create(OWNER)
+    asyncio.run(services.ingestion.ingest(OWNER, cid, "hr.md", hr_doc))
+    assert services.bm25.search(OWNER, cid, False, "sick leave", 3)
+    assert not services.bm25.search(OWNER, cid, False, "onboarding buddy", 3)
     other_replica_bm25 = services.bm25
     services.bm25 = type(other_replica_bm25)(services.chunks)  # fresh cache, as on another pod
-    asyncio.run(services.ingestion.ingest(OWNER, "ob.md", b"# Onboarding\n\nEvery new hire gets an onboarding buddy."))
+    asyncio.run(services.ingestion.ingest(OWNER, cid, "ob.md", b"# Onboarding\n\nEvery new hire gets an onboarding buddy."))
     # the ORIGINAL replica never saw invalidate(); the fingerprint must still refresh it
-    assert other_replica_bm25.search(OWNER, "onboarding buddy", 3)
+    assert other_replica_bm25.search(OWNER, cid, False, "onboarding buddy", 3)

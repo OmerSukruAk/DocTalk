@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import Response
 
 from app.auth import Principal, current_principal
 from app.domain import citation_dict
@@ -28,19 +28,24 @@ _MAX_UPLOAD_BATCH = 5
 @router.post("/documents", response_model=list[DocumentInfo], status_code=status.HTTP_201_CREATED)
 async def upload_documents(
     files: list[UploadFile] = File(...),
+    conversation_id: str = Form(...),
     principal: Principal = Depends(current_principal),
     services: Services = Depends(get_services),
     _rl: None = Depends(limit_upload),
 ) -> list[dict]:
     if not 1 <= len(files) <= _MAX_UPLOAD_BATCH:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"upload 1..{_MAX_UPLOAD_BATCH} files at a time")
+    if not conversation_id.strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "conversation_id is required")
+    if services.conversations.get(principal.owner_key, conversation_id.strip()) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
     results: list[dict] = []
     for upload in files:
         # Read at most max+1 bytes: an oversized upload is rejected without buffering it all.
         content = await upload.read(services.settings.max_file_bytes + 1)
         try:
             info = await services.ingestion.ingest(
-                principal.owner_key, upload.filename or "document", content
+                principal.owner_key, conversation_id.strip(), upload.filename or "document", content
             )
         except IngestionError as exc:
             code = (
@@ -85,12 +90,20 @@ def get_document_file(
     document_id: str,
     principal: Principal = Depends(current_principal),
     services: Services = Depends(get_services),
-) -> FileResponse:
+) -> Response:
     doc = services.documents.get(principal.owner_key, document_id)
-    if doc is None or not os.path.exists(doc.get("file_path", "")):
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "file not found")
+    try:
+        content = services.files.read(principal.owner_key, document_id)
+    except FileNotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "file not found")
     ext = os.path.splitext(doc["name"])[1].lower()
-    return FileResponse(doc["file_path"], filename=doc["name"], media_type=_MEDIA_TYPES.get(ext))
+    return Response(
+        content=content,
+        media_type=_MEDIA_TYPES.get(ext, "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="{doc["name"]}"'},
+    )
 
 
 @router.get("/passages/{sentence_id}", response_model=Passage)

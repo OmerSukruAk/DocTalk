@@ -38,12 +38,12 @@ class ParsedBlock:
     meta: dict = field(default_factory=dict)
 
 
-def parse(path: str) -> list[ParsedBlock]:
-    ext = os.path.splitext(path)[1].lower()
+def parse(filename: str, content: bytes) -> list[ParsedBlock]:
+    ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
-        return _parse_pdf(path)
+        return _parse_pdf(content)
     if ext in {".docx", ".md", ".markdown"}:
-        return _parse_markdown_like(path)
+        return _parse_markdown_like(ext, content)
     raise ValueError(f"Unsupported file type: {ext}")
 
 
@@ -51,12 +51,12 @@ def parse(path: str) -> list[ParsedBlock]:
 _SENTENCE_PUNCT = (".", "!", "?", "…", ":", ";", ",")
 
 
-def _parse_pdf(path: str) -> list[ParsedBlock]:
+def _parse_pdf(content: bytes) -> list[ParsedBlock]:
     import fitz  # PyMuPDF
 
     raw: list[dict] = []  # one entry per text block, in reading order, across all pages
     page_heights: dict[int, float] = {}
-    with fitz.open(path) as doc:
+    with fitz.open(stream=content, filetype="pdf") as doc:
         for page_index in range(doc.page_count):
             page = doc.load_page(page_index)
             page_no = page_index + 1
@@ -271,8 +271,8 @@ def _strip_inline_md(text: str) -> str:
     return _MD_CODE.sub(r"\1", text)
 
 
-def _parse_markdown_like(path: str) -> list[ParsedBlock]:
-    text = _to_markdown(path)
+def _parse_markdown_like(ext: str, content: bytes) -> list[ParsedBlock]:
+    text = _to_markdown(ext, content)
     blocks: list[ParsedBlock] = []
     heading_stack: list[str] = []
     buffer: list[str] = []
@@ -356,14 +356,14 @@ def _parse_markdown_like(path: str) -> list[ParsedBlock]:
     return blocks
 
 
-def _to_markdown(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
+def _to_markdown(ext: str, content: bytes) -> str:
     if ext in {".md", ".markdown"}:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    from markitdown import MarkItDown
+        return content.decode("utf-8", errors="replace")
+    import io
 
-    result = MarkItDown().convert(path)
+    from markitdown import MarkItDown, StreamInfo
+
+    result = MarkItDown().convert(io.BytesIO(content), stream_info=StreamInfo(extension=ext))
     return getattr(result, "text_content", "") or ""
 
 
@@ -640,9 +640,19 @@ class IngestionService:
         self._vectors = vectors
         self._bm25 = bm25
 
-    async def ingest(self, owner_key: str, filename: str, content: bytes) -> dict:
+    async def ingest(
+        self,
+        owner_key: str,
+        conversation_id: str,
+        filename: str,
+        content: bytes,
+        is_public: bool = False,
+    ) -> dict:
         """Validate -> parse/segment/chunk -> persist -> embed. CPU- and IO-bound steps run in
-        worker threads so one upload never blocks every other request on the event loop."""
+        worker threads so one upload never blocks every other request on the event loop.
+
+        Every uploaded file belongs to exactly one conversation; ``is_public`` is reserved
+        for documents placed in the shared public pool (managed out-of-band)."""
         ext = os.path.splitext(filename)[1].lower()
         if ext not in SUPPORTED_EXTS:
             raise IngestionError(f"unsupported file type '{ext}' (allowed: PDF, DOCX, MD)")
@@ -652,12 +662,14 @@ class IngestionService:
         content_hash = hashlib.sha256(content).hexdigest()
 
         def precheck() -> dict | None:
-            # Idempotent re-upload: identical bytes for the same owner return the existing doc.
-            existing = self._documents.find_by_hash(owner_key, content_hash)
+            # Idempotent re-upload within a conversation: identical bytes return the existing doc.
+            existing = self._documents.find_by_hash(owner_key, conversation_id, content_hash)
             if existing:
                 return existing
-            if self._documents.count(owner_key) >= self._settings.max_docs_per_user:
-                raise IngestionError(f"document limit reached ({self._settings.max_docs_per_user} per user)")
+            if self._documents.count(owner_key, conversation_id) >= self._settings.max_docs_per_conversation:
+                raise IngestionError(
+                    f"document limit reached ({self._settings.max_docs_per_conversation} per conversation)"
+                )
             return None
 
         existing = await asyncio.to_thread(precheck)
@@ -666,12 +678,12 @@ class IngestionService:
 
         document_id = "d_" + uuid.uuid4().hex[:16]
         name = os.path.basename(filename)
-        file_path = ""
+        file_id = ""
         mongo_written = False
         try:
             def process() -> tuple[str, list[Sentence], list[Chunk]]:
-                path = self._files.save(owner_key, document_id, filename, content)
-                sents = segment(parse(path), document_id)
+                file_id = self._files.save(owner_key, document_id, filename, content)
+                sents = segment(parse(filename, content), document_id)
                 if not sents:
                     raise IngestionError("no extractable text found in document")
                 chs = chunk(
@@ -681,10 +693,10 @@ class IngestionService:
                     overlap_sentences=self._settings.chunk_overlap_sentences,
                     min_tokens=self._settings.chunk_min_tokens,
                 )
-                return path, sents, chs
+                return file_id, sents, chs
 
             try:
-                file_path, sentences, chunks = await asyncio.to_thread(process)
+                file_id, sentences, chunks = await asyncio.to_thread(process)
             except IngestionError:
                 raise
             except Exception as exc:  # corrupt / encrypted / unparsable file -> 422, not 500
@@ -695,38 +707,61 @@ class IngestionService:
                     owner_key,
                     name=name,
                     type_=ext.lstrip("."),
-                    file_path=file_path,
+                    file_id=file_id,
                     sentence_count=len(sentences),
                     document_id=document_id,
                     content_hash=content_hash,
+                    conversation_id=conversation_id,
+                    is_public=is_public,
                 )
-                self._sentences.bulk_insert(owner_key, sentences)
-                self._chunks.bulk_insert(owner_key, chunks)
+                self._sentences.bulk_insert(owner_key, sentences, conversation_id=conversation_id, is_public=is_public)
+                self._chunks.bulk_insert(owner_key, chunks, conversation_id=conversation_id, is_public=is_public)
 
             mongo_written = True  # set before the write so a partial write is rolled back too
             await asyncio.to_thread(persist)
 
-            await self._index_vectors(owner_key, document_id, name, chunks)
+            await self._index_vectors(owner_key, conversation_id, is_public, document_id, name, chunks)
             self._bm25.invalidate(owner_key)
 
             info = await asyncio.to_thread(self._documents.get, owner_key, document_id)
             return info or {"id": document_id}
         except Exception:
-            await asyncio.to_thread(self._rollback, owner_key, document_id, file_path, mongo_written)
+            await asyncio.to_thread(self._rollback, owner_key, document_id, mongo_written)
             raise
 
-    async def _index_vectors(self, owner_key: str, document_id: str, doc_name: str, chunks: list[Chunk]) -> None:
+    async def _index_vectors(
+        self,
+        owner_key: str,
+        conversation_id: str,
+        is_public: bool,
+        document_id: str,
+        doc_name: str,
+        chunks: list[Chunk],
+    ) -> None:
         if not self._embeddings.configured:
             return  # degraded mode: BM25-only retrieval still works
         texts = [embed_text(c, doc_name) for c in chunks]
         vectors = await self._embeddings.embed(texts)
-        await asyncio.to_thread(
-            self._vectors.upsert,
-            owner_key,
-            [(c.chunk_id, document_id, vec) for c, vec in zip(chunks, vectors)],
-        )
+        points = [
+            {
+                "chunk_id": c.chunk_id,
+                "document_id": document_id,
+                "document_name": doc_name,
+                "chunk_idx": c.chunk_idx,
+                "text": c.text,
+                "heading": c.heading,
+                "headings": c.headings,
+                "token_count": c.token_count,
+                "sentence_ids": c.sentence_ids,
+                "page": c.page,
+                "is_table": c.is_table,
+                "vector": vec,
+            }
+            for c, vec in zip(chunks, vectors)
+        ]
+        await asyncio.to_thread(self._vectors.upsert, owner_key, conversation_id, is_public, points)
 
-    def _rollback(self, owner_key: str, document_id: str, file_path: str, mongo_written: bool) -> None:
+    def _rollback(self, owner_key: str, document_id: str, mongo_written: bool) -> None:
         try:
             if mongo_written:
                 self._sentences.delete_by_document(owner_key, document_id)

@@ -41,6 +41,7 @@ class AnswerMetrics(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+    include_public: bool = False  # also search the shared public pool of documents
 
 
 class AskResponse(BaseModel):
@@ -60,6 +61,8 @@ class DocumentInfo(BaseModel):
     type: str
     sentence_count: int
     created_at: str
+    conversation_id: str | None = None
+    is_public: bool = False
 
 
 class Passage(BaseModel):

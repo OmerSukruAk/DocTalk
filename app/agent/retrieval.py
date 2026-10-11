@@ -56,34 +56,40 @@ def lexical_coverage(query_terms: list[str], chunk_text: str) -> float:
 
 
 class BM25Index:
-    """Per-owner in-memory BM25 over parent chunks (BM25+ keeps scores non-negative even
-    for one-document corpora, where classic BM25 produces negative IDF).
+    """In-memory BM25 over parent chunks, keyed by conversation scope (BM25+ keeps scores
+    non-negative even for one-document corpora, where classic BM25 produces negative IDF).
 
-    Multi-replica safe: every lookup compares a cheap fingerprint of the owner's chunks in
+    Multi-replica safe: every lookup compares a cheap fingerprint of the scope's chunks in
     Mongo with the one the cached index was built from, so a document uploaded or deleted
     through another replica is picked up on the next question instead of being served from
     a stale index. ``invalidate`` is still called locally for an immediate refresh."""
 
     def __init__(self, chunks):
         self._chunks = chunks
-        self._cache: dict[str, tuple[BM25Plus | None, list[dict], object]] = {}
+        self._cache: dict[tuple, tuple[BM25Plus | None, list[dict], object]] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(owner_key: str, conversation_id: str, include_public: bool) -> tuple:
+        return (owner_key, conversation_id, bool(include_public))
 
     def invalidate(self, owner_key: str) -> None:
         with self._lock:
-            self._cache.pop(owner_key, None)
+            for key in [k for k in self._cache if k[0] == owner_key]:
+                self._cache.pop(key, None)
 
-    def _fingerprint(self, owner_key: str):
+    def _fingerprint(self, owner_key: str, conversation_id: str, include_public: bool):
         fp = getattr(self._chunks, "fingerprint", None)
-        return fp(owner_key) if fp else None
+        return fp(owner_key, conversation_id, include_public) if fp else None
 
-    def _get(self, owner_key: str) -> tuple[BM25Plus | None, list[dict]]:
-        fp = self._fingerprint(owner_key)
+    def _get(self, owner_key: str, conversation_id: str, include_public: bool) -> tuple[BM25Plus | None, list[dict]]:
+        key = self._key(owner_key, conversation_id, include_public)
+        fp = self._fingerprint(owner_key, conversation_id, include_public)
         with self._lock:
-            cached = self._cache.get(owner_key)
+            cached = self._cache.get(key)
             if cached is not None and cached[2] == fp:
                 return cached[0], cached[1]
-        docs = self._chunks.all_for_owner(owner_key)  # heavy work outside the lock
+        docs = self._chunks.all_for_scope(owner_key, conversation_id, include_public)  # heavy work outside the lock
         index = None
         if docs:
             # The heading is part of the searchable text: "leave policy" must find the
@@ -91,22 +97,22 @@ class BM25Index:
             corpus = [_tokenize(f"{' '.join(d.get('headings') or [d.get('heading') or ''])} {d['text']}") for d in docs]
             index = BM25Plus(corpus) if any(corpus) else None
         with self._lock:
-            self._cache[owner_key] = (index, docs, fp)
+            self._cache[key] = (index, docs, fp)
         return index, docs
 
-    def search(self, owner_key: str, query: str, top_k: int) -> list[tuple[str, float]]:
+    def search(self, owner_key: str, conversation_id: str, include_public: bool, query: str, top_k: int) -> list[tuple[str, float]]:
         terms = content_terms(query)
         if not terms:  # nothing but stopwords -> no lexical evidence at all
             return []
-        index, docs = self._get(owner_key)
+        index, docs = self._get(owner_key, conversation_id, include_public)
         if not index or not docs:
             return []
         scores = index.get_scores(terms)
         ranked = sorted(zip(docs, scores), key=lambda pair: pair[1], reverse=True)
         return [(d["_id"] if "_id" in d else d["id"], float(s)) for d, s in ranked[:top_k] if s > 0]
 
-    def all_documents(self, owner_key: str) -> list[dict]:
-        return self._get(owner_key)[1]
+    def all_documents(self, owner_key: str, conversation_id: str, include_public: bool) -> list[dict]:
+        return self._get(owner_key, conversation_id, include_public)[1]
 
 
 # --- embeddings ---
@@ -223,12 +229,16 @@ def hybrid_search_ex(
     bm25,
     reranker,
     owner_key: str,
+    conversation_id: str,
+    include_public: bool,
     query: str,
     query_vector: list[float] | None,
     top_k: int,
     neighbours: int,
 ) -> tuple[list[Hit], RetrievalSignals]:
     """Parent-child retrieval: propose chunks, re-rank, then expand to sentence hits.
+    Search is scoped to one conversation's documents; ``include_public`` also admits the
+    shared public pool.
     Returns ``(hits, signals)``; the signals feed the relevance gate.
 
     BM25 + vector search propose candidate *chunks* (a chunk carries multi-sentence
@@ -241,7 +251,7 @@ def hybrid_search_ex(
 
     bm25_ids: list[str] = []
     try:
-        bm25_ids = [cid for cid, _ in bm25.search(owner_key, query, candidate_k * 2)]
+        bm25_ids = [cid for cid, _ in bm25.search(owner_key, conversation_id, include_public, query, candidate_k * 2)]
     except Exception:
         bm25_ids = []
 
@@ -249,7 +259,7 @@ def hybrid_search_ex(
     signals = RetrievalSignals()
     if query_vector:
         try:
-            found = vectors.search(owner_key, query_vector, candidate_k * 2)
+            found = vectors.search(owner_key, conversation_id, include_public, query_vector, candidate_k * 2)
             vector_ids = [cid for cid, _ in found]
             if found:
                 signals.vector_top = max(score for _, score in found)
@@ -262,7 +272,7 @@ def hybrid_search_ex(
     signals.fused_top = max(fused.values())
     ranked_ids = sorted(fused, key=lambda cid: fused[cid], reverse=True)[:candidate_k]
 
-    chunk_docs = {c["id"]: c for c in chunks.get_many(owner_key, ranked_ids)}
+    chunk_docs = {c["id"]: c for c in chunks.get_many(owner_key, ranked_ids, include_public)}
     ordered = [chunk_docs[cid] for cid in ranked_ids if cid in chunk_docs]
 
     # Re-rank (cross-encoder scores (query, chunk)) or keep the fused order.
@@ -288,8 +298,8 @@ def hybrid_search_ex(
     sentence_ids: list[str] = []
     for c in ordered:
         sentence_ids.extend(c.get("sentence_ids") or [])
-    sdocs = {s["id"]: s for s in sentences.get_many(owner_key, sentence_ids)}
-    name_cache = _document_names(documents, owner_key, sdocs)
+    sdocs = {s["id"]: s for s in sentences.get_many(owner_key, sentence_ids, include_public)}
+    name_cache = _document_names(documents, owner_key, sdocs, include_public)
 
     hits: list[Hit] = []
     seen: set[str] = set()
@@ -308,7 +318,7 @@ def hybrid_search_ex(
         if not sdoc:
             continue
         base_score = chunk_scores.get(sdoc.get("chunk_id", ""), 0.0)
-        for nb in sentences.neighbors(owner_key, sdoc["document_id"], sdoc["idx"], neighbours):
+        for nb in sentences.neighbors(owner_key, sdoc["document_id"], sdoc["idx"], neighbours, include_public):
             if nb["id"] in seen:
                 continue
             seen.add(nb["id"])
@@ -318,13 +328,13 @@ def hybrid_search_ex(
     return hits, signals
 
 
-def _document_names(documents, owner_key: str, docs: dict[str, dict]) -> dict[str, str]:
+def _document_names(documents, owner_key: str, docs: dict[str, dict], include_public: bool) -> dict[str, str]:
     names: dict[str, str] = {}
     for doc in docs.values():
         did = doc["document_id"]
         if did in names:
             continue
-        info = documents.get(owner_key, did)
+        info = documents.get_scoped(owner_key, did, include_public)
         names[did] = info["name"] if info else ""
     return names
 

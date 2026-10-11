@@ -29,7 +29,7 @@ from app.dependencies import Services  # noqa: E402
 from app.observability import RequestLogger  # noqa: E402
 from app.repositories import storage  # noqa: E402
 from app.repositories.storage import (  # noqa: E402
-    ChunkRepo, ConversationRepo, DocumentRepo, FileStore, LogRepo, SentenceRepo,
+    ChunkRepo, ConversationRepo, DocumentRepo, LogRepo, SentenceRepo,
 )
 from app.repositories.vector_store import VectorStore  # noqa: E402
 
@@ -97,14 +97,40 @@ class FakeLLM:
         return {"claims": claims}, ChatResult("", 50, 20, 0.0)
 
 
+class InMemoryFileStore:
+    """GridFS stand-in: mongomock has no GridFS, and tests never touch the filesystem."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._data: dict[str, bytes] = {}
+
+    def _key(self, owner_key: str, document_id: str) -> str:
+        return f"{owner_key}:{document_id}"
+
+    def save(self, owner_key: str, document_id: str, filename: str, content: bytes) -> str:
+        if len(content) > self.max_bytes:
+            raise ValueError("file too large")
+        self._data[self._key(owner_key, document_id)] = content
+        return "gridfs-id"
+
+    def read(self, owner_key: str, document_id: str) -> bytes:
+        try:
+            return self._data[self._key(owner_key, document_id)]
+        except KeyError:
+            raise FileNotFoundError(document_id)
+
+    def delete_document(self, owner_key: str, document_id: str) -> None:
+        self._data.pop(self._key(owner_key, document_id), None)
+
+
 class NoNLI:
     configured = False
 
 
 @pytest.fixture()
-def settings(tmp_path):
+def settings():
     return Settings(
-        _env_file=None, files_dir=str(tmp_path), llm_api_key="x", embed_api_key="x",
+        _env_file=None, llm_api_key="x", embed_api_key="x",
         embed_dimensions=DIM, embed_model="fake-bow", rate_limit_ask_per_min=0,
         rate_limit_upload_per_min=0, log_text=True,
     )
@@ -120,7 +146,7 @@ def services(settings):
     vectors.ensure_collection(settings.embed_model, settings.embed_dimensions)
     bm25 = BM25Index(chunks)
     emb = FakeEmbeddings()
-    files = FileStore(settings.files_dir, settings.max_file_bytes)
+    files = InMemoryFileStore(settings.max_file_bytes)
     docs, sents, convs, logs = DocumentRepo(db), SentenceRepo(db), ConversationRepo(db), LogRepo(db)
     svc = Services(
         settings=settings, llm=FakeLLM(), embeddings=emb, nli=NoNLI(), reranker=ReRanker(settings),

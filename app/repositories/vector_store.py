@@ -43,6 +43,16 @@ class VectorStore:
         )
         self._client.create_payload_index(
             collection_name=self._collection,
+            field_name="conversation_id",
+            field_schema=qm.PayloadSchemaType.KEYWORD,
+        )
+        self._client.create_payload_index(
+            collection_name=self._collection,
+            field_name="is_public",
+            field_schema=qm.PayloadSchemaType.BOOL,
+        )
+        self._client.create_payload_index(
+            collection_name=self._collection,
             field_name="document_id",
             field_schema=qm.PayloadSchemaType.KEYWORD,
         )
@@ -74,21 +84,58 @@ class VectorStore:
         )
 
     # -- data -------------------------------------------------------------
-    def upsert(self, owner_key: str, points: list[tuple[str, str, list[float]]]) -> None:
-        """points: list of (chunk_id, document_id, vector)."""
-        structs = [
-            qm.PointStruct(
-                id=_point_id(owner_key, cid),
-                vector=vec,
-                payload={"chunk_id": cid, "document_id": did, "owner_key": owner_key},
+    def upsert(self, owner_key: str, conversation_id: str, is_public: bool, points: list[dict]) -> None:
+        """points: list[dict] with keys chunk_id, document_id, vector and (optional) chunk
+        metadata. The metadata is stored in the payload so the Qdrant UI shows the chunk's
+        text and how it was chunked (headings, token_count, sentence_ids, page, ...)."""
+        structs = []
+        for p in points:
+            payload = {
+                "owner_key": owner_key,
+                "conversation_id": conversation_id,
+                "is_public": is_public,
+                "chunk_id": p["chunk_id"],
+                "document_id": p["document_id"],
+                "document_name": p.get("document_name", ""),
+                "chunk_idx": p.get("chunk_idx"),
+                "text": p.get("text", ""),
+                "heading": p.get("heading"),
+                "headings": p.get("headings", []),
+                "token_count": p.get("token_count"),
+                "sentence_ids": p.get("sentence_ids", []),
+                "page": p.get("page"),
+                "is_table": p.get("is_table", False),
+            }
+            structs.append(
+                qm.PointStruct(
+                    id=_point_id(owner_key, p["chunk_id"]),
+                    vector=p["vector"],
+                    payload=payload,
+                )
             )
-            for cid, did, vec in points
-        ]
         if structs:
             self._client.upsert(collection_name=self._collection, points=structs, wait=True)
 
-    def search(self, owner_key: str, vector: list[float], top_k: int) -> list[tuple[str, float]]:
-        flt = qm.Filter(must=[qm.FieldCondition(key="owner_key", match=qm.MatchValue(value=owner_key))])
+    def search(
+        self,
+        owner_key: str,
+        conversation_id: str,
+        include_public: bool,
+        vector: list[float],
+        top_k: int,
+    ) -> list[tuple[str, float]]:
+        own = qm.Filter(
+            must=[
+                qm.FieldCondition(key="owner_key", match=qm.MatchValue(value=owner_key)),
+                qm.FieldCondition(key="conversation_id", match=qm.MatchValue(value=conversation_id)),
+            ]
+        )
+        if include_public:
+            flt = qm.Filter(
+                should=[own, qm.Filter(must=[qm.FieldCondition(key="is_public", match=qm.MatchValue(value=True))])]
+            )
+        else:
+            flt = own
         response = self._client.query_points(
             collection_name=self._collection,
             query=vector,

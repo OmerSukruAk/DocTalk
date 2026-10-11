@@ -55,14 +55,19 @@ def main() -> int:
     token = a.token or httpx.post(f"{a.issuer}/token", params={"user": a.user}).json()["access_token"]
     c = httpx.Client(base_url=a.api, headers={"Authorization": f"Bearer {token}"}, timeout=120)
 
+    cid = c.post("/v1/conversations").json()["id"]
+
     print("== 1. Upload ==")
     handles = [open(f, "rb") for f in a.files]
-    r = c.post("/v1/documents", files=[("files", (f.name.split("/")[-1], f)) for f in handles])
+    r = c.post(
+        "/v1/documents",
+        data={"conversation_id": cid},
+        files=[("files", (f.name.split("/")[-1], f)) for f in handles],
+    )
     r.raise_for_status()
     for d in r.json():
         print(f"  {d['name']}: {d['sentence_count']} citable sentences (id {d['id']})")
 
-    cid = c.post("/v1/conversations").json()["id"]
     ask = lambda q: c.post(f"/v1/conversations/{cid}/messages", json={"question": q}).json()
 
     print("\n== 2. Ask ==")

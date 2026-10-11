@@ -42,6 +42,7 @@ class GraphState(TypedDict, total=False):
     owner_key: str
     conversation_id: str
     question: str
+    include_public: bool
     rewritten_question: str
     history: list[dict]
 
@@ -129,6 +130,8 @@ class Nodes:
                 bm25=self.s.bm25,
                 reranker=self.s.reranker,
                 owner_key=state["owner_key"],
+                conversation_id=state["conversation_id"],
+                include_public=state.get("include_public", False),
                 query=query,
                 query_vector=query_vector,
                 top_k=state.get("top_k") or self.s.settings.top_k,
@@ -344,7 +347,7 @@ def render_answer(segments: list[dict]) -> str:
     return " ".join(parts)
 
 
-async def answer_question(services, graph, *, owner_key: str, conversation_id: str, question: str) -> dict:
+async def answer_question(services, graph, *, owner_key: str, conversation_id: str, question: str, include_public: bool = False) -> dict:
     request_id = uuid.uuid4().hex
     start = time.perf_counter()
     history = await asyncio.to_thread(services.conversations.recent_history, owner_key, conversation_id)
@@ -354,6 +357,7 @@ async def answer_question(services, graph, *, owner_key: str, conversation_id: s
         "owner_key": owner_key,
         "conversation_id": conversation_id,
         "question": question,
+        "include_public": include_public,
         "history": history,
         "attempt": 0,
         "top_k": services.settings.top_k,

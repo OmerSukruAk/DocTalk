@@ -21,9 +21,13 @@ def client(services):
 
 
 def test_upload_ask_citations_over_http(client, hr_doc):
-    r = client.post("/v1/documents", files=[("files", ("hr.md", io.BytesIO(hr_doc), "text/markdown"))])
-    assert r.status_code == 201 and r.json()[0]["sentence_count"] > 5
     cid = client.post("/v1/conversations").json()["id"]
+    r = client.post(
+        "/v1/documents",
+        data={"conversation_id": cid},
+        files=[("files", ("hr.md", io.BytesIO(hr_doc), "text/markdown"))],
+    )
+    assert r.status_code == 201 and r.json()[0]["sentence_count"] > 5
     a = client.post(f"/v1/conversations/{cid}/messages", json={"question": "How many sick leave days?"})
     body = a.json()
     assert a.status_code == 200 and body["status"] == "ok" and body["citations"]
@@ -32,15 +36,17 @@ def test_upload_ask_citations_over_http(client, hr_doc):
 
 
 def test_upload_validation(client):
-    assert client.post("/v1/documents", files=[("files", ("x.exe", b"MZ", "application/octet-stream"))]).status_code == 422
+    cid = client.post("/v1/conversations").json()["id"]
+    assert client.post("/v1/documents", data={"conversation_id": cid}, files=[("files", ("x.exe", b"MZ", "application/octet-stream"))]).status_code == 422
     six = [("files", (f"{i}.md", b"# a\n\nb c d.", "text/markdown")) for i in range(6)]
-    assert client.post("/v1/documents", files=six).status_code == 422
+    assert client.post("/v1/documents", data={"conversation_id": cid}, files=six).status_code == 422
 
 
 def test_oversized_upload_is_rejected_without_reading_it_all(client, services):
+    cid = client.post("/v1/conversations").json()["id"]
     services.settings.max_file_mb = 1
     big = b"# T\n\n" + b"x" * (2 * 1024 * 1024)
-    assert client.post("/v1/documents", files=[("files", ("big.md", big, "text/markdown"))]).status_code == 413
+    assert client.post("/v1/documents", data={"conversation_id": cid}, files=[("files", ("big.md", big, "text/markdown"))]).status_code == 413
 
 
 def test_admin_stats_requires_admin_role(client):

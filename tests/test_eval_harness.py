@@ -25,9 +25,10 @@ def test_harness_runs_end_to_end(services):
     app.state.services, app.state.graph = services, services.graph
     app.dependency_overrides[current_principal] = lambda: Principal("tid:eval", [])
     client = TestClient(app)
+    cid = client.post("/v1/conversations").json()["id"]
     files = [("files", (p.name, io.BytesIO(p.read_bytes()))) for p in sorted((ROOT / "eval/docs").glob("*.md"))]
-    assert client.post("/v1/documents", files=files).status_code == 201
-    result = run_eval.evaluate(client, json.loads((ROOT / "eval/dataset.json").read_text()))
+    assert client.post("/v1/documents", data={"conversation_id": cid}, files=files).status_code == 201
+    result = run_eval.evaluate(client, json.loads((ROOT / "eval/dataset.json").read_text()), conversation_id=cid)
     s = result["summary"]
     assert s["n"] == 17
     assert s["citation_validity"] == 1.0 and s["groundedness"] == 1.0

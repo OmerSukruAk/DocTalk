@@ -4,7 +4,6 @@ services:
     build: .
     env_file: .env
     ports: ["8000:8000"]
-    volumes: ["files:/data/files"]
     depends_on: [mongo, qdrant, dev-issuer]
   mongo:
     image: mongo:7
@@ -15,4 +14,4 @@ services:
   dev-issuer:          # demo-only Entra stand-in; remove when AUTH_MODE=entra
     build: ./dev_issuer
     ports: ["9000:9000"]
-volumes: { files: {}, mongo: {}, qdrant: {} }
+volumes: { mongo: {}, qdrant: {} }

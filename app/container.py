@@ -9,13 +9,12 @@ going through this module, so no two construction paths can drift apart.
 from __future__ import annotations
 
 import logging
-import os
 
 from pymongo import MongoClient
 
 from app.config import Settings, get_settings
 from app.dependencies import Services
-from app.observability import RequestLogger
+from app.observability import RequestLogger, install_mongo_logging
 from app.repositories import storage
 from app.repositories.storage import (
     ChunkRepo,
@@ -48,9 +47,9 @@ def build_container(settings: Settings | None = None) -> tuple[Services, MongoCl
     client = storage.get_client(settings)
     db = storage.get_db(client, settings)
     storage.ensure_indexes(db, settings)
-    os.makedirs(settings.files_dir, exist_ok=True)
+    install_mongo_logging(db, settings)
 
-    files = FileStore(settings.files_dir, settings.max_file_bytes)
+    files = FileStore(db, settings.max_file_bytes)
     documents = DocumentRepo(db)
     sentences = SentenceRepo(db)
     chunks = ChunkRepo(db)
