@@ -7,6 +7,7 @@ deterministic and runs before any LLM call, so an unanswerable question costs ze
 tokens."""
 
 from __future__ import annotations
+import math
 import re
 import threading
 from dataclasses import dataclass, field
@@ -173,6 +174,68 @@ class EmbeddingsClient:
         return (await self.embed([text]))[0]
 
 
+# --- question intent ---
+
+# "Summarise the document", "what is this file about", "key takeaways" have no topic to
+# search for: similarity search returns a random slice (or nothing passes the gate). Such
+# questions get an even sample of every document instead (see ``overview_chunks``).
+_OVERVIEW = re.compile(
+    r"\b(summar\w*|overview|outline|recap|tl;?dr|gist|key (?:points|takeaways|findings|messages)"
+    r"|main (?:points|ideas|topics|takeaways|messages)|highlights"
+    r"|what (?:is|are) (?:this|these|the|my) (?:document|file|pdf|report)s? about"
+    r"|what do(?:es)? (?:this|these|the|my) (?:document|file|pdf|report)s? (?:say|cover|contain)"
+    r"|shr[nň]\w*|özet\w*)\b",
+    re.IGNORECASE,
+)
+_GENERIC = frozenset(
+    "document documents doc docs file files pdf pdfs report reports text content contents whole entire "
+    "uploaded give please short brief briefly quick quickly provide write explain tell main key points "
+    "simple simply detail detailed few sentences bullet bullets words paragraph".split()
+)
+
+
+def is_overview_question(query: str, document_names: list[str] = ()) -> bool:
+    """True for 'summarise everything'-style questions with no narrower topic. 'Summarise the
+    dividend policy' is NOT an overview: it has a topic, so normal search handles it."""
+    if not _OVERVIEW.search(query):
+        return False
+    name_terms = {t for n in document_names for t in content_terms(re.sub(r"[_\W]+", " ", n))}
+    rest = [t for t in content_terms(_OVERVIEW.sub(" ", query)) if t not in _GENERIC and t not in name_terms]
+    return not rest
+
+
+def overview_chunks(all_chunks: list[dict], budget: int) -> list[dict]:
+    """An even sample across documents: the first chunk of every section first (that is where
+    the gist usually is), then evenly spaced remaining chunks, in document order."""
+    by_doc: dict[str, list[dict]] = {}
+    for c in all_chunks:
+        by_doc.setdefault(c["document_id"], []).append(c)
+    if not by_doc:
+        return []
+    quota = max(1, math.ceil(budget / len(by_doc)))
+    picked: list[dict] = []
+    for chunks in by_doc.values():
+        chunks = sorted(chunks, key=lambda c: c.get("chunk_idx", 0))
+        if len(chunks) <= quota:
+            picked.extend(chunks)
+            continue
+        chosen: list[dict] = []
+        seen_headings: set = set()
+        for c in chunks:
+            if c.get("heading") not in seen_headings:
+                seen_headings.add(c.get("heading"))
+                chosen.append(c)
+        if len(chosen) > quota:
+            step = len(chosen) / quota
+            chosen = [chosen[int(i * step)] for i in range(quota)]
+        else:
+            rest = [c for c in chunks if c not in chosen]
+            step = max(1, len(rest) // max(1, quota - len(chosen)))
+            chosen += rest[::step][: quota - len(chosen)]
+        picked.extend(sorted(chosen, key=lambda c: c.get("chunk_idx", 0)))
+    return picked
+
+
 # --- hybrid search ---
 
 RRF_K = 60
@@ -213,6 +276,7 @@ class RetrievalSignals:
     rerank_top: float | None = None  # best cross-encoder probability, when a re-ranker is on
     lexical_top: float = 0.0  # best coverage of the query's content words by a candidate chunk
     fused_top: float = 0.0
+    overview: bool = False  # 'summarise the documents': coverage sample, gate bypassed
 
 
 def hybrid_search(**kwargs) -> list[Hit]:
@@ -235,18 +299,31 @@ def hybrid_search_ex(
     query_vector: list[float] | None,
     top_k: int,
     neighbours: int,
+    raw_query: str | None = None,
 ) -> tuple[list[Hit], RetrievalSignals]:
     """Parent-child retrieval: propose chunks, re-rank, then expand to sentence hits.
-    Search is scoped to one conversation's documents; ``include_public`` also admits the
-    shared public pool.
     Returns ``(hits, signals)``; the signals feed the relevance gate.
 
-    BM25 + vector search propose candidate *chunks* (a chunk carries multi-sentence
-    context, so its embedding is meaningful), they are fused with RRF and optionally
-    re-ranked by a cross-encoder, and the surviving chunks expand back into their
+    Search is scoped to one conversation's documents; ``include_public`` also admits the
+    shared public pool. BM25 + vector search propose candidate *chunks* (a chunk carries
+    multi-sentence context, so its embedding is meaningful), they are fused with RRF and
+    optionally re-ranked by a cross-encoder, and the surviving chunks expand back into their
     child sentences for citation. Degrades gracefully: BM25-only when embeddings are
     unavailable, fused-order-only when the re-ranker is off.
+
+    Overview questions ('summarise the documents') skip search and get an even sample of
+    every document in scope instead. ``raw_query`` is the user's own wording: "Summarise this
+    document" is an overview even if the rewrite step attached an earlier topic to it.
     """
+    signals = RetrievalSignals()
+    names = [d.get("name", "") for d in documents.list(owner_key, conversation_id)] if hasattr(documents, "list") else []
+    if is_overview_question(query, names) or (raw_query and is_overview_question(raw_query, names)):
+        sample = overview_chunks(bm25.all_documents(owner_key, conversation_id, include_public), max(top_k, 12))
+        if sample:
+            signals.overview = True
+            scores = {c["id"]: 1.0 for c in sample}
+            return _expand(sample, scores, sentences, documents, owner_key, include_public, 0), signals
+
     candidate_k = reranker.candidates(top_k) if reranker.configured else top_k
 
     bm25_ids: list[str] = []
@@ -256,7 +333,6 @@ def hybrid_search_ex(
         bm25_ids = []
 
     vector_ids: list[str] = []
-    signals = RetrievalSignals()
     if query_vector:
         try:
             found = vectors.search(owner_key, conversation_id, include_public, query_vector, candidate_k * 2)
@@ -293,8 +369,11 @@ def hybrid_search_ex(
         ),
         default=0.0,
     )
+    return _expand(ordered, chunk_scores, sentences, documents, owner_key, include_public, neighbours), signals
 
-    # Expand surviving chunks into their child sentences (primary hits).
+
+def _expand(ordered, chunk_scores, sentences, documents, owner_key: str, include_public: bool, neighbours: int) -> list[Hit]:
+    """Expand ranked chunks into their child sentences (primary hits) plus neighbour context."""
     sentence_ids: list[str] = []
     for c in ordered:
         sentence_ids.extend(c.get("sentence_ids") or [])
@@ -304,7 +383,7 @@ def hybrid_search_ex(
     hits: list[Hit] = []
     seen: set[str] = set()
     for c in ordered:
-        score = chunk_scores.get(c["id"], fused.get(c["id"], 0.0))
+        score = chunk_scores.get(c["id"], 0.0)
         for sid in c.get("sentence_ids") or []:
             sdoc = sdocs.get(sid)
             if not sdoc or sid in seen:
@@ -313,7 +392,7 @@ def hybrid_search_ex(
             hits.append(_to_hit(sdoc, name_cache, score, is_context=False))
 
     # Neighbour expansion around cited sentences (context only; lower score).
-    for sid in list(sentence_ids):
+    for sid in list(sentence_ids) if neighbours > 0 else []:
         sdoc = sdocs.get(sid)
         if not sdoc:
             continue
@@ -324,8 +403,7 @@ def hybrid_search_ex(
             seen.add(nb["id"])
             name_cache.setdefault(nb["document_id"], name_cache.get(nb["document_id"], ""))
             hits.append(_to_hit(nb, name_cache, base_score * 0.5, is_context=True))
-
-    return hits, signals
+    return hits
 
 
 def _document_names(documents, owner_key: str, docs: dict[str, dict], include_public: bool) -> dict[str, str]:
@@ -369,20 +447,30 @@ def is_relevant(hits: list[Hit], min_score: float) -> bool:
 
 
 def passes_gate(hits: list[Hit], signals: RetrievalSignals, settings) -> bool:
-    """Deterministic relevance gate, evaluated before any LLM call so an unanswerable
-    question costs zero tokens.
+    """Deterministic relevance gate, evaluated before any LLM call so an off-topic question
+    costs zero tokens.
 
-    * cross-encoder available  -> its probability is authoritative (most precise signal);
-    * else vector search ran   -> best cosine similarity, OR strong lexical coverage (an exact
-      keyword/ID question can legitimately have a weak embedding match);
-    * else (BM25 only)         -> lexical coverage of the query's content words.
+    It refuses only when EVERY available signal says 'unrelated'. Making one signal
+    authoritative (the cross-encoder used to be) refused many answerable questions: an
+    English MS-MARCO cross-encoder scores paraphrases, table rows and non-English questions
+    low even when the passage answers them.
+
+    * overview question ('summarise the documents') -> passes whenever documents exist;
+    * cross-encoder probability >= GATE_MIN_RERANK_SCORE -> pass;
+    * best cosine similarity    >= GATE_MIN_VECTOR_SCORE -> pass;
+    * BM25 only (no semantic signal) -> lexical coverage >= GATE_MIN_LEXICAL_COVERAGE;
+      with semantic signals, lexical coverage alone must be strong (exact IDs / codes).
     Thresholds live in Settings and should be calibrated with eval/run_eval.py."""
     if not any(not h.is_context for h in hits):
         return False
+    if signals.overview:
+        return True
     if signals.fused_top < settings.gate_min_score:
         return False
-    if signals.rerank_top is not None:
-        return signals.rerank_top >= settings.gate_min_rerank_score
+    if signals.rerank_top is not None and signals.rerank_top >= settings.gate_min_rerank_score:
+        return True
     if signals.vector_top is not None and signals.vector_top >= settings.gate_min_vector_score:
         return True
-    return signals.lexical_top >= settings.gate_min_lexical_coverage
+    if signals.rerank_top is None and signals.vector_top is None:
+        return signals.lexical_top >= settings.gate_min_lexical_coverage
+    return signals.lexical_top >= max(settings.gate_min_lexical_coverage, 0.75)

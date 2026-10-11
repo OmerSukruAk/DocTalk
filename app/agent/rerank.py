@@ -8,7 +8,13 @@ behaviour. Scores are sigmoid probabilities in [0, 1].
 
 from __future__ import annotations
 
+import math
+
 from app.config import Settings
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
 
 
 class ReRanker:
@@ -22,6 +28,7 @@ class ReRanker:
         self._model_name = settings.rerank_model
         self._candidates = settings.rerank_candidates
         self._model = None
+        self._raw_logits = False
 
     @property
     def configured(self) -> bool:
@@ -36,14 +43,30 @@ class ReRanker:
             from sentence_transformers import CrossEncoder
 
             self._model = CrossEncoder(self._model_name)
+            # Many cross-encoders (e.g. ms-marco-MiniLM) ship with an Identity activation and
+            # return raw logits (-11 .. +10). The gate threshold is a probability, so convert.
+            act = getattr(self._model, "activation_fn", None) or getattr(
+                self._model, "default_activation_function", None
+            )
+            self._raw_logits = act is None or type(act).__name__ == "Identity"
         return self._model
 
     def rerank(self, query: str, chunks: list[dict], top_k: int) -> list[tuple[dict, float]]:
-        """Re-score ``(query, chunk_text)`` pairs, return top_k as ``(chunk, score)``."""
+        """Re-score ``(query, section + chunk_text)`` pairs, return top_k as ``(chunk, prob)``."""
         if not chunks:
             return []
         model = self._load()
-        pairs = [(query, c["text"]) for c in chunks]
-        scores = model.predict(pairs)
-        scored = sorted(zip(chunks, scores), key=lambda t: float(t[1]), reverse=True)
-        return [(c, float(s)) for c, s in scored[:top_k]]
+        pairs = [(query, _passage(c)) for c in chunks]
+        scores = [float(s) for s in model.predict(pairs)]
+        if self._raw_logits or any(s < 0 or s > 1 for s in scores):
+            scores = [_sigmoid(s) for s in scores]
+        scored = sorted(zip(chunks, scores), key=lambda t: t[1], reverse=True)
+        return scored[:top_k]
+
+
+def _passage(chunk: dict) -> str:
+    """The section title is part of the passage: 'dividend policy' must match a table whose
+    rows only say 'INTERIM DPS: €1.28'."""
+    headings = chunk.get("headings") or ([chunk["heading"]] if chunk.get("heading") else [])
+    title = " | ".join(h.split(" > ")[-1] for h in headings)
+    return f"{title}. {chunk['text']}" if title else chunk["text"]
