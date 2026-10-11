@@ -32,7 +32,7 @@ review would ask about.
 - [x] Question and answer text not logged by default; log retention limit; user deletion cascades
 - [x] Rate limits; upload size, type and count limits
 - [x] Audit trail per request: request id, user, status, cost, reasons for removed statements
-- [x] 56 automated tests and an evaluation harness (groundedness, citation validity, refusal metrics)
+- [x] 62 automated tests and an evaluation harness (groundedness, citation validity, refusal metrics)
 
 ## Risks and open items
 
