@@ -113,6 +113,18 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     assert r["diagnostics"]["verification"]["rules"]["removed"] == {"fact": 1}
 
 
+def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
+    svc, cid, _ = ready
+    sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
+    # the model put the id in the text and left the citation list empty: its digits must not
+    # fail the numbers check, and the id must not be shown to the user
+    svc.llm.extra_claims = [{"text": f"Sick leave is 10 days per year [{sid}].", "citations": []}]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    assert r["dropped_claims"] == 0
+    assert all("d_" not in s["text"] for s in r["segments"])
+    assert any(s["text"] == "Sick leave is 10 days per year." and s["citations"] for s in r["segments"])
+
+
 def test_invented_citation_id_is_rejected(ready):
     svc, cid, _ = ready
     svc.llm.extra_claims = [{"text": "Sick leave is 10 days.", "citations": ["d_fake:s999"]}]

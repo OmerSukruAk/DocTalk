@@ -16,6 +16,7 @@ persist the messages and emit one request_logs record."""
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import TypedDict
@@ -433,6 +434,11 @@ _KINDS = {"fact", "insight", "gap"}
 _FORMATS = {"paragraph", "bullet", "text"}
 
 
+# Sentence ids the model sometimes writes into the text itself ("... trigger [d_ab12:s28]."):
+# their digits would fail the numbers check, and they must never reach the user.
+_INLINE_ID = re.compile(r"\s*[\[(]?\b(d_[0-9a-z]+:s\d+)\b[\])]?", re.IGNORECASE)
+
+
 def parse_segments(data: dict) -> list[Claim]:
     """Model JSON -> claims. Accepts the current {"segments": [...]} shape and the older
     {"claims": [...]} one (facts only)."""
@@ -449,6 +455,12 @@ def parse_segments(data: dict) -> list[Claim]:
         kind = str(raw.get("kind", "fact")).strip().lower()
         fmt = str(raw.get("format", "text")).strip().lower()
         citations = [str(c).strip().strip("[]") for c in (raw.get("citations") or []) if c]
+        inline = _INLINE_ID.findall(text)
+        if inline:  # move them out of the text and into the citation list
+            text = _INLINE_ID.sub("", text).strip()
+            citations += [sid for sid in inline if sid not in citations]
+            if not text:
+                continue
         claims.append(
             Claim(
                 text=text.lstrip("-•* ").strip() if fmt == "bullet" else text,
