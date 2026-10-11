@@ -77,3 +77,15 @@ def test_judge_outage_fails_closed():
 
     v = _run(Claim("Managers approve requests.", ["s1"]), _NLI(0.5), Boom())
     assert not v.ok and v.stage_decided == "judge_unavailable"
+
+
+def test_framing_is_kept_only_when_it_carries_no_information():
+    from app.agent.verification import check_framing
+
+    sources = ["Remote work is allowed two days per week.", "Leave must be approved by the line manager."]
+    for ok in ("Dear Manager,", "Kind regards", "Here is what the policy says about remote work:"):
+        assert check_framing(ok, sources) == [], ok
+    assert check_framing("Remote work is allowed.", sources)            # restates the documents
+    assert check_framing("You get 25 days.", sources)                   # a number
+    assert check_framing("You cannot do that.", sources)                # a negation
+    assert check_framing(" ".join(["word"] * 16), sources)              # too long

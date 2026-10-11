@@ -269,10 +269,12 @@ def _search_lines(search: dict | None, attempts: int, cited: int, documents: int
     return _lines(lines)
 
 
-_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"))
+_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"),
+          ("framing", "framing", "framing"))
 _CHECKS = (
     ("rules", "Rule checks (citation ids, numbers, negations)"),
     ("gap", "Gap check"),
+    ("framing", "Framing check (greetings, headings: no information allowed)"),
     ("nli", "NLI model"),
     ("judge", "Judge agent (LLM)"),
     ("judge_unavailable", "Judge agent unavailable"),
@@ -330,7 +332,8 @@ def _steps(msg: dict, question: str | None) -> list:
         "Nothing relevant found" if nothing_written
         else f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}")))
     rows.append(_step("3", "Writing the answer", t.get("generate"),
-                      None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted",
+                      None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted"
+                      + (f" in the requested style: “{msg['style']}”" if msg.get("style") else ""),
                       skipped=nothing_written))
     checked = _check_lines(diag.get("verification")) or (
         f"Kept {_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · "
@@ -518,6 +521,7 @@ main = dmc.AppShellMain(html.Div([
     ], className="docs"),
     html.Div(id="chat", className="chat"),
     html.Div([
+        html.Div(id="style-badge", className="style-badge-row"),
         html.Div([
             dmc.Popover([
                 dmc.PopoverTarget(dmc.ActionIcon(icon("adjustments-horizontal", 18), variant="subtle",
@@ -857,7 +861,7 @@ def answer(request, session, style, include_public, messages):
                         bool(include_public))
     except api.ApiError as exc:
         return messages, api_error(exc)
-    return [*messages, {"role": "assistant", **reply}], no_update
+    return [*messages, {"role": "assistant", **reply, "style": (style or "").strip() or None}], no_update
 
 
 @app.callback(Output("chat", "children"), Input("messages", "data"), Input("show-details", "checked"))
@@ -877,6 +881,25 @@ app.clientside_callback(
     Output("scroll-sink", "children"),
     Input("chat", "children"),
 )
+
+
+@app.callback(Output("style-badge", "children"), Input("style", "value"))
+def show_style(style):
+    """While a style is set, show it above the message box, with an x to clear it."""
+    style = (style or "").strip()
+    if not style:
+        return None
+    return dmc.Badge(
+        [icon("wand", 12), f" Answer style: {style}"], variant="light", radius="xl", size="lg", tt="none",
+        rightSection=dmc.ActionIcon(icon("x", 12), id="style-clear", variant="transparent", size="xs", color="nn"),
+        className="style-badge",
+    )
+
+
+@app.callback(Output("style", "value", allow_duplicate=True), Input("style-clear", "n_clicks"),
+              prevent_initial_call=True)
+def clear_style(clicks):
+    return "" if clicks else no_update
 
 
 # --- source viewer ------------------------------------------------------------------------------

@@ -78,6 +78,9 @@ class GraphState(TypedDict, total=False):
     judge_calls: int
 
 
+_NO_CONTENT = ("gap", "framing")  # segments that carry no answer of their own
+
+
 # --- graph nodes ---
 
 def _acc(state: GraphState, name: str, start: float, t_in: int = 0, t_out: int = 0, cost: float = 0.0) -> dict:
@@ -282,8 +285,9 @@ class Nodes:
         segments: list[dict] = []
         gaps: list[str] = []
         for verdict in kept:
-            if verdict.claim.kind == "gap":
-                gaps.append(verdict.claim.text)
+            if verdict.claim.kind in ("gap", "framing"):
+                if verdict.claim.kind == "gap":
+                    gaps.append(verdict.claim.text)
                 segments.append(_segment(verdict.claim, []))
                 continue
             nums: list[int] = []
@@ -312,7 +316,7 @@ class Nodes:
             if nums:
                 segments.append(_segment(verdict.claim, nums))
 
-        if not any(s["kind"] != "gap" for s in segments):
+        if not any(s["kind"] not in _NO_CONTENT for s in segments):
             if gaps:
                 reason = " ".join(gaps)
             elif dropped:
@@ -382,7 +386,7 @@ class Nodes:
         it would double cost and latency and could replace good content with worse."""
         verdicts = state.get("verdicts") or []
         any_failed = any(not v.ok for v in verdicts)
-        any_kept = any(v.ok and v.claim.kind != "gap" for v in verdicts)
+        any_kept = any(v.ok and v.claim.kind not in _NO_CONTENT for v in verdicts)
         if any_failed and not any_kept and (state.get("attempt") or 0) < self.s.settings.max_retries:
             return "retry_prepare"
         return "finalize_answer"
@@ -430,7 +434,7 @@ def build_graph(services):
     return graph.compile()
 
 
-_KINDS = {"fact", "insight", "gap"}
+_KINDS = {"fact", "insight", "gap", "framing"}
 _FORMATS = {"paragraph", "bullet", "text"}
 
 

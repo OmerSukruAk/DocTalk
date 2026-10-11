@@ -254,6 +254,30 @@ class ClaimVerdict:
 
 
 _MAX_GAP_WORDS = 40
+_MAX_FRAMING_WORDS = 15
+_WORD = re.compile(r"[^\W\d_]{3,}")
+
+
+def check_framing(text: str, context_texts: list[str]) -> list[str]:
+    """Framing (greeting, sign-off, heading, lead-in) is kept only if it carries no
+    information: short, no numbers, no negation, and it does not restate the documents
+    (two or more of their content words), unless it is a lead-in ending in ':'."""
+    from app.agent.retrieval import STOPWORDS
+
+    reasons = []
+    if len(text.split()) > _MAX_FRAMING_WORDS:
+        reasons.append("framing too long")
+    if extract_numbers(text):
+        reasons.append("framing contains a number")
+    if _has_negation(text.lower()):
+        reasons.append("framing contains a negation")
+    if not text.rstrip().endswith(":"):
+        words = {w.lower() for w in _WORD.findall(text)} - STOPWORDS
+        source_words = {w.lower() for t in context_texts for w in _WORD.findall(t)}
+        shared = sorted(words & source_words)
+        if len(shared) >= 2:
+            reasons.append(f"framing restates document content ({', '.join(shared)})")
+    return reasons
 
 
 async def verify_claims(
@@ -275,12 +299,20 @@ async def verify_claims(
     * insight - the model's own commentary; must be grounded in (and cite) the sources, but
                 may contain derived numbers (a calculation), so only the judge decides.
     * gap     - 'the documents do not cover X': carries no facts and no citations; kept
-                when short."""
+                when short.
+    * framing - greeting, sign-off, heading or lead-in a requested format needs; kept only
+                if it carries no information (see ``check_framing``)."""
     verdicts: list[ClaimVerdict | None] = []
     pending: list[tuple[int, Claim, list[dict], float | None]] = []
     allowed_ids = set(context_by_id)
 
+    context_texts = [c["text"] for c in context_by_id.values()]
     for claim in claims:
+        if claim.kind == "framing":
+            claim.citations = []
+            reasons = check_framing(claim.text, context_texts)
+            verdicts.append(ClaimVerdict(claim=claim, ok=not reasons, stage_decided="framing", reasons=reasons))
+            continue
         if claim.kind == "gap":
             short = len(claim.text.split()) <= _MAX_GAP_WORDS
             claim.citations = []
