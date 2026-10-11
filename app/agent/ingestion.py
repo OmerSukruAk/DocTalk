@@ -38,12 +38,12 @@ class ParsedBlock:
     meta: dict = field(default_factory=dict)
 
 
-def parse(path: str) -> list[ParsedBlock]:
-    ext = os.path.splitext(path)[1].lower()
+def parse(filename: str, content: bytes) -> list[ParsedBlock]:
+    ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
-        return _parse_pdf(path)
+        return _parse_pdf(content)
     if ext in {".docx", ".md", ".markdown"}:
-        return _parse_markdown_like(path)
+        return _parse_markdown_like(ext, content)
     raise ValueError(f"Unsupported file type: {ext}")
 
 
@@ -51,17 +51,18 @@ def parse(path: str) -> list[ParsedBlock]:
 _SENTENCE_PUNCT = (".", "!", "?", "…", ":", ";", ",")
 
 
-def _parse_pdf(path: str) -> list[ParsedBlock]:
+def _parse_pdf(content: bytes) -> list[ParsedBlock]:
     import fitz  # PyMuPDF
 
     raw: list[dict] = []  # one entry per text block, in reading order, across all pages
     page_heights: dict[int, float] = {}
-    with fitz.open(path) as doc:
+    with fitz.open(stream=content, filetype="pdf") as doc:
         for page_index in range(doc.page_count):
             page = doc.load_page(page_index)
             page_no = page_index + 1
             page_heights[page_no] = float(page.rect.height)
-            table_rects, table_blocks = _extract_tables(page, page_no)
+            tables = _extract_tables(page, page_no)
+            table_rects = [rect for rect, _rows in tables]
 
             text_blocks: list[dict] = []
             for b in page.get_text("dict", sort=True).get("blocks", []):
@@ -87,7 +88,7 @@ def _parse_pdf(path: str) -> list[ParsedBlock]:
                     continue
                 x0, y0, x1, y1 = b["bbox"]
                 rect = fitz.Rect(x0, y0, x1, y1)
-                if any(rect.intersects(tr) for tr in table_rects):
+                if _mostly_inside(rect, table_rects):
                     continue  # already captured as table rows
                 size = max(sizes, key=lambda s: s[1])[0] if sizes else 0.0
                 text_blocks.append(
@@ -103,17 +104,16 @@ def _parse_pdf(path: str) -> list[ParsedBlock]:
                     }
                 )
 
-            # Merge table rows back into reading order (tables used to be emitted first).
-            by_table: dict[tuple, list[ParsedBlock]] = {}
-            for tb in table_blocks:
-                by_table.setdefault(tuple(tb.bbox or ()), []).append(tb)
+            text_blocks = _reading_order(text_blocks)
+
+            # Merge table rows back into reading order (by the table's top edge).
             merged: list[dict] = []
-            pending = sorted(by_table.items(), key=lambda kv: kv[0][1] if kv[0] else 0)
+            pending = sorted(tables, key=lambda t: t[0].y0)
             for blk in text_blocks:
-                while pending and pending[0][0] and pending[0][0][1] <= blk["bbox"][1]:
+                while pending and pending[0][0].y0 <= blk["bbox"][1]:
                     merged.extend(_table_entries(pending.pop(0)[1]))
                 merged.append(blk)
-            for _bbox, rows in pending:
+            for _rect, rows in pending:
                 merged.extend(_table_entries(rows))
             raw.extend(merged)
 
@@ -129,6 +129,81 @@ def _table_entries(rows: list[ParsedBlock]) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def _mostly_inside(rect, regions: list) -> bool:
+    """True when at least half of ``rect`` lies inside one of ``regions`` (a paragraph that
+    merely touches a table edge is kept; text that belongs to the table is dropped)."""
+    area = rect.get_area() or 1.0
+    return any((rect & region).get_area() >= 0.5 * area for region in regions if rect.intersects(region))
+
+
+def _reading_order(blocks: list[dict]) -> list[dict]:
+    """Fix reading order for side-by-side layouts (KPI cards, two-column boxes).
+
+    PyMuPDF sorts blocks by y then x, which interleaves columns: 'LABEL A LABEL B value A
+    value B'. Runs of narrow blocks are split into columns (by horizontal overlap) and read
+    column by column; each block gets a ``col`` key so ``_assign_pdf_headings`` can glue the
+    pieces of one card back into a single citable block. Single-column text is untouched."""
+    if len(blocks) < 2:
+        return blocks
+    left = min(b["bbox"][0] for b in blocks)
+    right = max(b["bbox"][2] for b in blocks)
+    narrow_max = 0.5 * max(1.0, right - left)
+
+    out: list[dict] = []
+    run: list[dict] = []
+
+    def flush(run_no: int) -> None:
+        columns: list[list[dict]] = []
+        for b in run:
+            for col in columns:
+                cx0 = min(c["bbox"][0] for c in col)
+                cx1 = max(c["bbox"][2] for c in col)
+                overlap = min(cx1, b["bbox"][2]) - max(cx0, b["bbox"][0])
+                if overlap >= 0.5 * min(cx1 - cx0, b["bbox"][2] - b["bbox"][0]):
+                    col.append(b)
+                    break
+            else:
+                columns.append([b])
+        if len(columns) < 2:
+            out.extend(run)
+            return
+        columns.sort(key=lambda col: min(c["bbox"][0] for c in col))
+        for ci, col in enumerate(columns):
+            for b in sorted(col, key=lambda c: c["bbox"][1]):
+                out.append({**b, "col": (b["page"], run_no, ci)})
+
+    narrow = [b for b in blocks if b["bbox"][2] - b["bbox"][0] < narrow_max]
+
+    def beside_another(b: dict) -> bool:
+        """Another narrow block shares its vertical band without overlapping horizontally:
+        that is what a column layout looks like (a lone short heading is not one)."""
+        x0, y0, x1, y1 = b["bbox"]
+        return any(
+            o is not b and o["bbox"][1] < y1 - 1 and o["bbox"][3] > y0 + 1
+            and (o["bbox"][2] <= x0 or o["bbox"][0] >= x1)
+            for o in narrow
+        )
+
+    for i, b in enumerate(blocks):
+        if b["bbox"][2] - b["bbox"][0] < narrow_max and beside_another(b):
+            run.append(b)
+            continue
+        if run:
+            flush(i)
+            run = []
+        out.append(b)
+    if run:
+        flush(len(blocks))
+    return out
+
+
+def _is_textual(text: str) -> bool:
+    """Headings are words, not numbers: '€1.38' or '197%' in a big KPI font is not a section."""
+    chars = [c for c in text if not c.isspace()]
+    letters = sum(c.isalpha() for c in chars)
+    return letters >= 3 and letters >= 0.5 * len(chars)
 
 
 def _join_pdf_lines(lines: list[str]) -> str:
@@ -185,9 +260,39 @@ def _assign_pdf_headings(raw: list[dict]) -> list[ParsedBlock]:
     body = max(weight, key=weight.get)
 
     def is_heading(b: dict) -> bool:
-        if b["table"] or b["n_lines"] > 3 or len(b["text"]) > 120 or b["text"].endswith(_SENTENCE_PUNCT):
+        if b["table"] or b.get("merged") or b["n_lines"] > 3 or len(b["text"]) > 120:
+            return False
+        if b["text"].endswith(_SENTENCE_PUNCT) or not _is_textual(b["text"]):
             return False
         return b["size"] >= body * 1.15 or (b["bold"] and b["size"] >= body * 0.98 and len(b["text"]) > 2)
+
+    # Glue the pieces of one card / column box ('OPERATING RESULT' + '€1.44B' + '+8.6% Y-o-Y')
+    # into one block, so the value is cited together with its label.
+    glued: list[dict] = []
+    for b in raw:
+        prev = glued[-1] if glued else None
+        if (
+            prev is not None
+            and b.get("col") is not None
+            and prev.get("col") == b.get("col")
+            and b["bbox"][1] - prev["bbox"][3] <= max(8.0, 1.2 * max(prev["size"], b["size"]))
+            and not is_heading(prev)
+            and not is_heading(b)
+        ):
+            glued[-1] = {
+                **prev,
+                "text": f"{prev['text']} {b['text']}",
+                "bbox": [
+                    min(prev["bbox"][0], b["bbox"][0]), prev["bbox"][1],
+                    max(prev["bbox"][2], b["bbox"][2]), b["bbox"][3],
+                ],
+                "n_lines": prev["n_lines"] + b["n_lines"],
+                "chars": prev["chars"] + b["chars"],
+                "merged": True,
+            }
+            continue
+        glued.append(b)
+    raw = glued
 
     heading_sizes = sorted({b["size"] for b in prose if is_heading(b) and b["size"] >= body * 1.15}, reverse=True)
 
@@ -212,47 +317,153 @@ def _assign_pdf_headings(raw: list[dict]) -> list[ParsedBlock]:
     return blocks
 
 
-def _extract_tables(page, page_no: int) -> tuple[list, list[ParsedBlock]]:
-    """Best-effort table extraction: each data row becomes one atomic block with its
-    column headers attached ('Leave type: Sick | Days: 10')."""
+def _extract_tables(page, page_no: int) -> list[tuple[object, list[ParsedBlock]]]:
+    """Best-effort table extraction: every data row becomes one atomic block with its column
+    headers attached ('FINANCIAL YEAR: 2024 Actual | TOTAL DPS: €3.44'). Returns
+    ``[(table_region, row_blocks)]``.
+
+    PyMuPDF's detector often sees a zebra-striped table as several one-row 'tables' (only the
+    shaded rows have filled rectangles) and misses the unshaded rows between them. Pieces that
+    share the same columns are therefore merged back into one table, and the rows between or
+    right after them are rebuilt from word positions using the detected column boundaries."""
     import fitz
 
-    rects: list = []
-    blocks: list[ParsedBlock] = []
     try:
-        found = page.find_tables()
+        found = list(getattr(page.find_tables(), "tables", []) or [])
     except Exception:
-        return rects, blocks
-    for table in getattr(found, "tables", []) or []:
-        try:
-            data = table.extract()
-        except Exception:
+        return []
+    words = page.get_text("words")  # (x0, y0, x1, y1, text, block, line, word_no)
+    out: list[tuple[object, list[ParsedBlock]]] = []
+    for group in _group_split_tables(found):
+        columns = _table_columns(group)
+        if len(columns) < 2:
             continue
-        if not data:
+        bands = _table_bands(group, columns, words)
+        rows = [cells for cells in (_cells_in_band(band, columns, words) for band in bands) if any(cells)]
+        if not rows:
             continue
-        rects.append(fitz.Rect(table.bbox))
-        headers = [(h or "").strip() for h in data[0]]
-        for row in data[1:]:
-            cells = [(c or "").strip() for c in row]
-            if not any(cells):
-                continue
+        x0, x1 = columns[0][0], columns[-1][1]
+        region = fitz.Rect(x0, bands[0][0], x1, bands[-1][1])
+        header = rows[0] if len(rows) > 1 and _looks_like_header(rows[0]) else None
+        body = rows[1:] if header else rows
+        blocks: list[ParsedBlock] = []
+        for cells, band in zip(body, bands[1:] if header else bands):
             parts = []
-            for header, cell in zip(headers, cells):
+            for i, cell in enumerate(cells):
                 if not cell:
                     continue
-                parts.append(f"{header}: {cell}" if header else cell)
-            text = " | ".join(parts)
-            if text:
+                label = header[i] if header and i < len(header) else ""
+                parts.append(f"{label}: {cell}" if label else cell)
+            if parts:
                 blocks.append(
                     ParsedBlock(
-                        text=text,
+                        text=" | ".join(parts),
                         page=page_no,
                         heading=None,
-                        bbox=[round(v, 1) for v in table.bbox],
+                        bbox=[round(x0, 1), round(band[0], 1), round(x1, 1), round(band[1], 1)],
                         is_table_row=True,
                     )
                 )
-    return rects, blocks
+        if blocks:
+            out.append((region, blocks))
+    return out
+
+
+def _group_split_tables(tables: list) -> list[list]:
+    """Merge vertically stacked table pieces that have the same columns."""
+    groups: list[list] = []
+    for t in sorted(tables, key=lambda t: t.bbox[1]):
+        if groups:
+            last = groups[-1][-1]
+            heights = [r.bbox[3] - r.bbox[1] for g in groups[-1] for r in g.rows] or [20.0]
+            if (
+                t.col_count == last.col_count
+                and abs(t.bbox[0] - last.bbox[0]) <= 4
+                and abs(t.bbox[2] - last.bbox[2]) <= 4
+                and t.bbox[1] - last.bbox[3] <= 2.5 * max(heights)
+            ):
+                groups[-1].append(t)
+                continue
+        groups.append([t])
+    return groups
+
+
+def _table_columns(group: list) -> list[tuple[float, float]]:
+    """Column x-ranges, taken from the first row of the group that has every cell."""
+    for t in group:
+        for row in t.rows:
+            cells = row.cells
+            if cells and all(c is not None for c in cells):
+                return [(c[0], c[2]) for c in cells]
+    t = group[0]
+    return [(c[0], c[2]) for c in (t.rows[0].cells if t.rows else []) if c is not None]
+
+
+def _words_in(words, y0: float, y1: float, x0: float, x1: float) -> list:
+    return [
+        w for w in words
+        if y0 <= (w[1] + w[3]) / 2 < y1 and x0 <= (w[0] + w[2]) / 2 <= x1
+    ]
+
+
+def _table_bands(group: list, columns: list[tuple[float, float]], words) -> list[tuple[float, float]]:
+    """Row bands (y0, y1): the detected rows, the gaps between them that contain text in at
+    least two columns (unshaded rows), and the same for the rows right after the last piece."""
+    x0, x1 = columns[0][0], columns[-1][1]
+
+    def column_of(x: float) -> int | None:
+        return next((i for i, (c0, c1) in enumerate(columns) if c0 <= x <= c1), None)
+
+    def is_row(y0: float, y1: float) -> bool:
+        hit = _words_in(words, y0, y1, x0, x1)
+        lines: dict[tuple, set] = {}
+        for w in hit:
+            lines.setdefault((w[5], w[6]), set()).add(column_of((w[0] + w[2]) / 2))
+        if any(len(cols) > 1 for cols in lines.values()):
+            return False  # a text line running across columns is prose below the table
+        return len(set().union(*lines.values()) - {None}) >= 2 if lines else False
+
+    detected = sorted({(r.bbox[1], r.bbox[3]) for t in group for r in t.rows})
+    bands: list[tuple[float, float]] = []
+    for y0, y1 in detected:
+        if bands and y0 - bands[-1][1] > 3 and is_row(bands[-1][1], y0):
+            bands.append((bands[-1][1], y0))
+        bands.append((y0, y1))
+    height = statistics.median(y1 - y0 for y0, y1 in detected) if detected else 20.0
+    for _ in range(50):  # unshaded rows after the last detected piece
+        y0 = bands[-1][1]
+        if not is_row(y0, y0 + height * 1.25):
+            break
+        bands.append((y0, y0 + height * 1.25))
+    return bands
+
+
+def _cells_in_band(band: tuple[float, float], columns: list[tuple[float, float]], words) -> list[str]:
+    cells: list[str] = []
+    for c0, c1 in columns:
+        hit = sorted(_words_in(words, band[0], band[1], c0, c1), key=lambda w: (round(w[1]), w[0]))
+        text = ""
+        for w in hit:
+            token = w[4]
+            if text.endswith("-") and token[:1].isalpha():
+                text += token  # 'Non-' + 'Life' -> 'Non-Life'
+            else:
+                text = f"{text} {token}" if text else token
+        cells.append(re.sub(r"([€$£¥])\s+(?=\d)", r"", text).strip())
+    return cells
+
+
+def _looks_like_header(cells: list[str]) -> bool:
+    """A header row labels columns: mostly upper-case or bold-looking words, no money/percent
+    values ('2028 TARGET' is a header, '€1.28' is data)."""
+    filled = [c for c in cells if c]
+    if len(filled) < 2:
+        return False
+    if any(re.search(r"[€$£¥%]", c) or re.fullmatch(r"[+-]?[\d.,]+\s*[A-Za-z]{0,3}", c) for c in filled):
+        return False
+    letters = [ch for c in filled for ch in c if ch.isalpha()]
+    upper = sum(ch.isupper() for ch in letters)
+    return bool(letters) and (upper / len(letters) >= 0.6 or all(len(c) <= 30 for c in filled))
 
 
 # ------------------------------------------------------------------ DOCX / MD
@@ -271,8 +482,8 @@ def _strip_inline_md(text: str) -> str:
     return _MD_CODE.sub(r"\1", text)
 
 
-def _parse_markdown_like(path: str) -> list[ParsedBlock]:
-    text = _to_markdown(path)
+def _parse_markdown_like(ext: str, content: bytes) -> list[ParsedBlock]:
+    text = _to_markdown(ext, content)
     blocks: list[ParsedBlock] = []
     heading_stack: list[str] = []
     buffer: list[str] = []
@@ -356,14 +567,14 @@ def _parse_markdown_like(path: str) -> list[ParsedBlock]:
     return blocks
 
 
-def _to_markdown(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
+def _to_markdown(ext: str, content: bytes) -> str:
     if ext in {".md", ".markdown"}:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    from markitdown import MarkItDown
+        return content.decode("utf-8", errors="replace")
+    import io
 
-    result = MarkItDown().convert(path)
+    from markitdown import MarkItDown, StreamInfo
+
+    result = MarkItDown().convert(io.BytesIO(content), stream_info=StreamInfo(extension=ext))
     return getattr(result, "text_content", "") or ""
 
 
@@ -589,8 +800,13 @@ def chunk(
     segs = _merge_small(_segments(sentences), min_tokens, max_tokens)
 
     chunks: list[Chunk] = []
+    last_group: list[Sentence] | None = None
     for seg in segs:
         previous: list[Sentence] | None = None
+        if last_group and last_group[-1].heading == seg.sentences[0].heading:
+            # Same section, different kind (prose intro -> table): the intro ('The table below
+            # shows the stress-test impact...') is what makes the table's embedding findable.
+            previous = last_group
         for group in _pack(seg, max_tokens, min_tokens):
             cidx = len(chunks)
             cid = chunk_id(document_id, cidx)
@@ -602,7 +818,7 @@ def chunk(
                 if s.heading and s.heading not in headings:
                     headings.append(s.heading)
             context = ""
-            if previous and not seg.is_table and overlap_sentences > 0:
+            if previous and overlap_sentences > 0 and not previous[-1].is_table_row:
                 context = " ".join(s.text for s in previous[-overlap_sentences:])
             chunks.append(
                 Chunk(
@@ -620,6 +836,7 @@ def chunk(
                 )
             )
             previous = group
+        last_group = previous
     return chunks
 
 
@@ -640,9 +857,19 @@ class IngestionService:
         self._vectors = vectors
         self._bm25 = bm25
 
-    async def ingest(self, owner_key: str, filename: str, content: bytes) -> dict:
+    async def ingest(
+        self,
+        owner_key: str,
+        conversation_id: str,
+        filename: str,
+        content: bytes,
+        is_public: bool = False,
+    ) -> dict:
         """Validate -> parse/segment/chunk -> persist -> embed. CPU- and IO-bound steps run in
-        worker threads so one upload never blocks every other request on the event loop."""
+        worker threads so one upload never blocks every other request on the event loop.
+
+        Every uploaded file belongs to exactly one conversation; ``is_public`` is reserved
+        for documents placed in the shared public pool (managed out-of-band)."""
         ext = os.path.splitext(filename)[1].lower()
         if ext not in SUPPORTED_EXTS:
             raise IngestionError(f"unsupported file type '{ext}' (allowed: PDF, DOCX, MD)")
@@ -652,12 +879,14 @@ class IngestionService:
         content_hash = hashlib.sha256(content).hexdigest()
 
         def precheck() -> dict | None:
-            # Idempotent re-upload: identical bytes for the same owner return the existing doc.
-            existing = self._documents.find_by_hash(owner_key, content_hash)
+            # Idempotent re-upload within a conversation: identical bytes return the existing doc.
+            existing = self._documents.find_by_hash(owner_key, conversation_id, content_hash)
             if existing:
                 return existing
-            if self._documents.count(owner_key) >= self._settings.max_docs_per_user:
-                raise IngestionError(f"document limit reached ({self._settings.max_docs_per_user} per user)")
+            if self._documents.count(owner_key, conversation_id) >= self._settings.max_docs_per_conversation:
+                raise IngestionError(
+                    f"document limit reached ({self._settings.max_docs_per_conversation} per conversation)"
+                )
             return None
 
         existing = await asyncio.to_thread(precheck)
@@ -666,12 +895,12 @@ class IngestionService:
 
         document_id = "d_" + uuid.uuid4().hex[:16]
         name = os.path.basename(filename)
-        file_path = ""
+        file_id = ""
         mongo_written = False
         try:
             def process() -> tuple[str, list[Sentence], list[Chunk]]:
-                path = self._files.save(owner_key, document_id, filename, content)
-                sents = segment(parse(path), document_id)
+                file_id = self._files.save(owner_key, document_id, filename, content)
+                sents = segment(parse(filename, content), document_id)
                 if not sents:
                     raise IngestionError("no extractable text found in document")
                 chs = chunk(
@@ -681,10 +910,10 @@ class IngestionService:
                     overlap_sentences=self._settings.chunk_overlap_sentences,
                     min_tokens=self._settings.chunk_min_tokens,
                 )
-                return path, sents, chs
+                return file_id, sents, chs
 
             try:
-                file_path, sentences, chunks = await asyncio.to_thread(process)
+                file_id, sentences, chunks = await asyncio.to_thread(process)
             except IngestionError:
                 raise
             except Exception as exc:  # corrupt / encrypted / unparsable file -> 422, not 500
@@ -695,38 +924,61 @@ class IngestionService:
                     owner_key,
                     name=name,
                     type_=ext.lstrip("."),
-                    file_path=file_path,
+                    file_id=file_id,
                     sentence_count=len(sentences),
                     document_id=document_id,
                     content_hash=content_hash,
+                    conversation_id=conversation_id,
+                    is_public=is_public,
                 )
-                self._sentences.bulk_insert(owner_key, sentences)
-                self._chunks.bulk_insert(owner_key, chunks)
+                self._sentences.bulk_insert(owner_key, sentences, conversation_id=conversation_id, is_public=is_public)
+                self._chunks.bulk_insert(owner_key, chunks, conversation_id=conversation_id, is_public=is_public)
 
             mongo_written = True  # set before the write so a partial write is rolled back too
             await asyncio.to_thread(persist)
 
-            await self._index_vectors(owner_key, document_id, name, chunks)
+            await self._index_vectors(owner_key, conversation_id, is_public, document_id, name, chunks)
             self._bm25.invalidate(owner_key)
 
             info = await asyncio.to_thread(self._documents.get, owner_key, document_id)
             return info or {"id": document_id}
         except Exception:
-            await asyncio.to_thread(self._rollback, owner_key, document_id, file_path, mongo_written)
+            await asyncio.to_thread(self._rollback, owner_key, document_id, mongo_written)
             raise
 
-    async def _index_vectors(self, owner_key: str, document_id: str, doc_name: str, chunks: list[Chunk]) -> None:
+    async def _index_vectors(
+        self,
+        owner_key: str,
+        conversation_id: str,
+        is_public: bool,
+        document_id: str,
+        doc_name: str,
+        chunks: list[Chunk],
+    ) -> None:
         if not self._embeddings.configured:
             return  # degraded mode: BM25-only retrieval still works
         texts = [embed_text(c, doc_name) for c in chunks]
         vectors = await self._embeddings.embed(texts)
-        await asyncio.to_thread(
-            self._vectors.upsert,
-            owner_key,
-            [(c.chunk_id, document_id, vec) for c, vec in zip(chunks, vectors)],
-        )
+        points = [
+            {
+                "chunk_id": c.chunk_id,
+                "document_id": document_id,
+                "document_name": doc_name,
+                "chunk_idx": c.chunk_idx,
+                "text": c.text,
+                "heading": c.heading,
+                "headings": c.headings,
+                "token_count": c.token_count,
+                "sentence_ids": c.sentence_ids,
+                "page": c.page,
+                "is_table": c.is_table,
+                "vector": vec,
+            }
+            for c, vec in zip(chunks, vectors)
+        ]
+        await asyncio.to_thread(self._vectors.upsert, owner_key, conversation_id, is_public, points)
 
-    def _rollback(self, owner_key: str, document_id: str, file_path: str, mongo_written: bool) -> None:
+    def _rollback(self, owner_key: str, document_id: str, mongo_written: bool) -> None:
         try:
             if mongo_written:
                 self._sentences.delete_by_document(owner_key, document_id)

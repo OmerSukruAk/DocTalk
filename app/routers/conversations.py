@@ -74,6 +74,7 @@ async def ask(
     if not question:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "question must not be empty")
     return await answer_question(
-        services, graph, owner_key=owner, conversation_id=conversation_id, question=question
+        services, graph, owner_key=owner, conversation_id=conversation_id, question=question,
+        include_public=body.include_public, style=body.style,
     )
 

@@ -91,6 +91,45 @@ class RequestLogger:
             pass
 
 
+# --- system logging to Mongo ---
+
+class MongoLogHandler(logging.Handler):
+    """Writes standard library log records into MongoDB's ``system_logs`` collection.
+
+    Best-effort and recursion-safe by design: a failed write is swallowed and never
+    re-logged, so observability can never break an answer or loop on a Mongo outage."""
+
+    def __init__(self, db, settings: Settings):
+        super().__init__(level=logging.INFO)
+        self._c = db.system_logs
+        self._settings = settings
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            doc = {
+                "created_at": datetime.now(timezone.utc),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            if record.exc_info:
+                doc["exc"] = self.format(record)
+            self._c.insert_one(doc)
+        except Exception:
+            pass
+
+
+def install_mongo_logging(db, settings: Settings) -> None:
+    """Attach the Mongo handler to the shared 'doctalk' logger (idempotent)."""
+    logger = logging.getLogger("doctalk")
+    if any(isinstance(h, MongoLogHandler) for h in logger.handlers):
+        return
+    handler = MongoLogHandler(db, settings)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
 # --- metrics ---
 
 def compute_stats(log_repo) -> dict:

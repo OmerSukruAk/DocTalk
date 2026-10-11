@@ -30,17 +30,24 @@ class Citation(BaseModel):
 class AnswerSegment(BaseModel):
     text: str
     citations: list[int]               # -> Citation.n, rendered as [1][2]
+    kind: Literal["fact", "insight", "gap"] = "fact"  # insight = assistant's grounded commentary
+    format: Literal["paragraph", "bullet", "text"] = "text"
 
 
 class AnswerMetrics(BaseModel):
     total_ms: int
-    tokens_in: int
+    tokens_in: int                     # all LLM calls: rewrite, translate, answer, verifier
     tokens_out: int
     cost_usd: float
+    # Wall time per stage: rewrite, translate, retrieve (embed + search + re-rank),
+    # generate (answer LLM), verify (rules + judge LLM), other (history, persistence, logging)
+    timings_ms: dict[str, float] = {}
 
 
 class AskRequest(BaseModel):
     question: str
+    style: str | None = None  # optional tone / format, e.g. "casual", "executive summary", "in Turkish"
+    include_public: bool = False  # also search the shared public pool of documents
 
 
 class AskResponse(BaseModel):
@@ -48,6 +55,7 @@ class AskResponse(BaseModel):
     status: Literal["ok", "partial", "refused", "error"]
     refusal_reason: str | None = None
     rewritten_question: str | None = None
+    answer: str = ""                   # markdown rendering of the segments with [n] markers
     segments: list[AnswerSegment]
     citations: list[Citation]
     dropped_claims: int = 0
@@ -60,6 +68,8 @@ class DocumentInfo(BaseModel):
     type: str
     sentence_count: int
     created_at: str
+    conversation_id: str | None = None
+    is_public: bool = False
 
 
 class Passage(BaseModel):

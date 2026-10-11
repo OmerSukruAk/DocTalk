@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     mongo_uri: str = "mongodb://mongo:27017"
     mongo_db: str = "doctalk"
     qdrant_url: str = "http://qdrant:6333"
-    files_dir: str = "/data/files"
 
     # --- Auth ---
     auth_mode: str = "entra"  # entra | dev
@@ -45,7 +44,7 @@ class Settings(BaseSettings):
     dev_audience: str = "doctalk-dev"
 
     # --- Behaviour ---
-    max_docs_per_user: int = 5
+    max_docs_per_conversation: int = 5
     max_file_mb: int = 20
     top_k: int = 8
     chunk_max_tokens: int = 256

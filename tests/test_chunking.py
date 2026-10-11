@@ -6,9 +6,7 @@ DOC = "d_test"
 
 
 def _chunks_for(md: str, tmp_path, max_tokens=256, **kw):
-    p = tmp_path / "x.md"
-    p.write_text(md, encoding="utf-8")
-    sents = segment(parse(str(p)), DOC)
+    sents = segment(parse("x.md", md.encode("utf-8")), DOC)
     return sents, chunk(sents, DOC, max_tokens, **kw)
 
 
@@ -89,9 +87,8 @@ def test_embed_text_carries_document_and_section_context(tmp_path):
 
 
 def test_markdown_lists_become_separate_sentences_and_markup_is_stripped(tmp_path):
-    p = tmp_path / "l.md"
-    p.write_text("# T\n\n- **Bold** item one\n- item two with [link](http://x.y)\n", encoding="utf-8")
-    texts = [b.text for b in _parse_markdown_like(str(p))]
+    md = "# T\n\n- **Bold** item one\n- item two with [link](http://x.y)\n"
+    texts = [b.text for b in _parse_markdown_like(".md", md.encode("utf-8"))]
     assert texts == ["Bold item one", "item two with link"]
 
 

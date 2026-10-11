@@ -40,15 +40,19 @@ def pct(values: list[float], p: int) -> float:
     return v[min(len(v) - 1, round((p / 100) * (len(v) - 1)))]
 
 
-def evaluate(client: httpx.Client, dataset: list[dict]) -> dict:
+def evaluate(client: httpx.Client, dataset: list[dict], conversation_id: str | None = None) -> dict:
     convs: dict[str, str] = {}
     rows = []
     for item in dataset:
         key = item.get("conversation") or item["id"]
-        if key not in convs:
-            convs[key] = client.post("/v1/conversations").json()["id"]
+        if conversation_id is not None:
+            cid = conversation_id  # every question runs in the pre-seeded conversation
+        else:
+            if key not in convs:
+                convs[key] = client.post("/v1/conversations").json()["id"]
+            cid = convs[key]
         t0 = time.perf_counter()
-        resp = client.post(f"/v1/conversations/{convs[key]}/messages", json={"question": item["q"]}).json()
+        resp = client.post(f"/v1/conversations/{cid}/messages", json={"question": item["q"]}).json()
         wall_ms = round((time.perf_counter() - t0) * 1000)
 
         answered = resp["status"] in ("ok", "partial")
@@ -61,13 +65,18 @@ def evaluate(client: httpx.Client, dataset: list[dict]) -> dict:
             p = client.get(f"/v1/passages/{c['sentence_id']}", params={"context": 0})
             valid.append(p.status_code == 200 and p.json()["citation"]["text"] == c["text"])
 
-        # groundedness: each segment cited + numbers appear in cited text
+        # groundedness: each fact/insight segment is cited; every number in a FACT appears in its
+        # cited text (insights may contain derived numbers, e.g. a computed difference; 'gap'
+        # notes state what is missing and carry no citations)
         seg_ok = []
         for seg in resp.get("segments", []):
+            kind = seg.get("kind", "fact")
+            if kind == "gap":
+                continue
             cited_text = " ".join(cites[n]["text"] for n in seg["citations"] if n in cites)
             nums = {_norm_num(n) for n in NUM.findall(seg["text"])}
             src = {_norm_num(n) for n in NUM.findall(cited_text)}
-            seg_ok.append(bool(seg["citations"]) and nums <= src)
+            seg_ok.append(bool(seg["citations"]) and (kind == "insight" or nums <= src))
 
         low = text.lower()
         acc = None
@@ -141,9 +150,10 @@ def main() -> None:
     a = ap.parse_args()
     token = a.token or httpx.post(f"{a.issuer}/token", params={"user": "eval"}).json()["access_token"]
     client = httpx.Client(base_url=a.api, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+    cid = client.post("/v1/conversations").json()["id"]
     files = [("files", (Path(d).name, open(d, "rb"))) for d in a.docs]
-    client.post("/v1/documents", files=files).raise_for_status()
-    result = evaluate(client, json.loads(Path(a.dataset).read_text()))
+    client.post("/v1/documents", data={"conversation_id": cid}, files=files).raise_for_status()
+    result = evaluate(client, json.loads(Path(a.dataset).read_text()), conversation_id=cid)
     Path(a.out).write_text(to_markdown(result, f"API: {a.api} - run: {time.strftime('%Y-%m-%d %H:%M')}"))
     Path(a.out).with_suffix(".json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result["summary"], indent=2))

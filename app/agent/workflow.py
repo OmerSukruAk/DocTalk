@@ -1,6 +1,7 @@
 """The LangGraph workflow and its state.
 
 rewrite -> retrieve_and_gate -(no)-> refuse
+                            -(no, foreign-language question)-> translate -> retrieve_and_gate (once)
                             -(yes)-> generate -(LLM error)-> fail
                                               -> verify -(pass)-> finalize_answer
                                                         -(fail & attempt<MAX_RETRIES)-> retry_prepare
@@ -25,10 +26,12 @@ from app.agent.llm import (
     GENERATE_USER,
     REWRITE_SYSTEM,
     REWRITE_USER,
+    TRANSLATE_SYSTEM,
+    TRANSLATE_USER,
     build_history_block,
     build_sources_block,
 )
-from app.agent.retrieval import Hit, RetrievalSignals, hybrid_search_ex, passes_gate
+from app.agent.retrieval import Hit, RetrievalSignals, hybrid_search_ex, looks_foreign, passes_gate
 from app.agent.verification import Claim, ClaimVerdict, verify_claims
 
 logger = logging.getLogger("doctalk")
@@ -42,7 +45,11 @@ class GraphState(TypedDict, total=False):
     owner_key: str
     conversation_id: str
     question: str
+    style: str | None
+    include_public: bool
     rewritten_question: str
+    search_query: str | None  # set by translate: the question in the documents' language
+    translated: bool
     history: list[dict]
 
     attempt: int
@@ -73,8 +80,10 @@ class GraphState(TypedDict, total=False):
 # --- graph nodes ---
 
 def _acc(state: GraphState, name: str, start: float, t_in: int = 0, t_out: int = 0, cost: float = 0.0) -> dict:
+    """Add this node's wall time and token use to the running totals. Times ADD UP: after a
+    retry or a translation, retrieve/generate/verify run twice and both runs count."""
     node_ms = dict(state.get("node_ms") or {})
-    node_ms[name] = round((time.perf_counter() - start) * 1000, 1)
+    node_ms[name] = round(node_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000, 1)
     return {
         "node_ms": node_ms,
         "tokens_in": (state.get("tokens_in") or 0) + t_in,
@@ -101,7 +110,7 @@ class Nodes:
                 res = await self.s.llm.chat(
                     REWRITE_SYSTEM,
                     REWRITE_USER.format(history=build_history_block(history), question=question),
-                    max_tokens=256,
+                    max_tokens=1024,  # headroom for hidden reasoning tokens
                 )
                 rewritten = res.text.strip() or question
                 t_in, t_out, cost = res.tokens_in, res.tokens_out, res.cost_usd
@@ -112,7 +121,7 @@ class Nodes:
     # -------------------------------------------------- retrieve_and_gate
     async def retrieve_and_gate(self, state: GraphState) -> dict:
         start = time.perf_counter()
-        query = state.get("rewritten_question") or state["question"]
+        query = state.get("search_query") or state.get("rewritten_question") or state["question"]
         query_vector = None
         if self.s.embeddings.configured:
             try:
@@ -129,7 +138,10 @@ class Nodes:
                 bm25=self.s.bm25,
                 reranker=self.s.reranker,
                 owner_key=state["owner_key"],
+                conversation_id=state["conversation_id"],
+                include_public=state.get("include_public", False),
                 query=query,
+                raw_query=state["question"],
                 query_vector=query_vector,
                 top_k=state.get("top_k") or self.s.settings.top_k,
                 neighbours=self.s.settings.context_neighbours,
@@ -138,34 +150,77 @@ class Nodes:
         relevant = passes_gate(hits, signals, self.s.settings)
         return {"hits": hits, "signals": signals, "relevant": relevant, **_acc(state, "retrieve", start)}
 
+    # -------------------------------------------------------------- translate
+    async def translate(self, state: GraphState) -> dict:
+        """Cross-language fallback: a Turkish question about an English document shares no
+        keywords with it, and an English cross-encoder cannot score it. Rewrite the question
+        once into the documents' language (judged from their section titles) and search again."""
+        start = time.perf_counter()
+        query = state.get("rewritten_question") or state["question"]
+        chunks = await asyncio.to_thread(
+            self.s.bm25.all_documents, state["owner_key"], state["conversation_id"], state.get("include_public", False)
+        )
+        titles: list[str] = []
+        for c in chunks:
+            for h in c.get("headings") or ([c["heading"]] if c.get("heading") else []):
+                title = h.split(" > ")[-1]
+                if title not in titles:
+                    titles.append(title)
+        sample = "\n".join(titles[:15]) or (chunks[0]["text"][:300] if chunks else "")
+        translated = query
+        t_in = t_out = 0
+        cost = 0.0
+        if sample:
+            try:
+                res = await self.s.llm.chat(
+                    TRANSLATE_SYSTEM, TRANSLATE_USER.format(sample=sample, question=query), max_tokens=1024
+                )
+                translated = res.text.strip() or query
+                t_in, t_out, cost = res.tokens_in, res.tokens_out, res.cost_usd
+            except Exception as exc:
+                logger.warning("query translation failed: %s", exc)
+        return {"search_query": translated, "translated": True, **_acc(state, "translate", start, t_in, t_out, cost)}
+
     # --------------------------------------------------------------- generate
     async def generate(self, state: GraphState) -> dict:
         start = time.perf_counter()
         hits = state.get("hits") or []
         sources = [
-            {"sentence_id": h.sentence_id, "document_name": h.document_name, "text": h.text}
+            {
+                "sentence_id": h.sentence_id,
+                "document_name": h.document_name,
+                "text": h.text,
+                "heading": h.heading,
+                "page": h.page,
+                "idx": h.idx,
+            }
             for h in hits
         ]
         if not self.s.llm.configured:
             return {"claims": [], **_acc(state, "generate", start)}
-        # Generate against the *resolved* question ("And remote work?" -> "What is the remote
-        # work policy?"), the same one retrieval used, so follow-ups stay grounded.
-        question = state.get("rewritten_question") or state["question"]
+        # The model sees the user's own words (tone / format instructions live there) plus the
+        # resolved question that retrieval used ("And meals?" -> "What is the meal limit?").
+        question = state["question"]
+        rewritten = state.get("rewritten_question") or question
+        resolved = f"\n(Standalone version: {rewritten})" if rewritten.strip() != question.strip() else ""
+        style = f"\nRequested answer style: {state['style']}" if state.get("style") else ""
         try:
             data, res = await self.s.llm.complete_json(
                 GENERATE_SYSTEM,
-                GENERATE_USER.format(sources=build_sources_block(sources), question=question),
-                max_tokens=1024,
+                GENERATE_USER.format(
+                    history=build_history_block(state.get("history") or []),
+                    sources=build_sources_block(sources),
+                    question=question,
+                    resolved=resolved,
+                    style=style,
+                ),
+                max_tokens=4000,  # reasoning models spend part of this before answering
+                temperature=0.3,
             )
         except Exception as exc:
             logger.error("generation failed: %s", exc)
             return {"claims": [], "error": f"{type(exc).__name__}: {exc}", **_acc(state, "generate", start)}
-        claims: list[Claim] = []
-        for raw in data.get("claims", []) or []:
-            text = str(raw.get("text", "")).strip()
-            citations = [str(c) for c in (raw.get("citations") or []) if c]
-            if text:
-                claims.append(Claim(text=text, citations=citations))
+        claims = parse_segments(data)
         return {
             "claims": claims,
             **_acc(state, "generate", start, res.tokens_in, res.tokens_out, res.cost_usd),
@@ -183,6 +238,7 @@ class Nodes:
             }
             for h in hits
         }
+        usage: dict = {}
         verdicts = await verify_claims(
             state.get("claims") or [],
             context_by_id=context_by_id,
@@ -190,12 +246,16 @@ class Nodes:
             llm=self.s.llm,
             nli_pass=self.s.settings.nli_pass,
             nli_fail=self.s.settings.nli_fail,
+            usage=usage,
         )
         judge_calls = sum(1 for v in verdicts if v.used_judge)
         return {
             "verdicts": verdicts,
             "judge_calls": (state.get("judge_calls") or 0) + judge_calls,
-            **_acc(state, "verify", start),
+            **_acc(
+                state, "verify", start,
+                usage.get("tokens_in", 0), usage.get("tokens_out", 0), usage.get("cost_usd", 0.0),
+            ),
         }
 
     # ---------------------------------------------------------- retry_prepare
@@ -219,7 +279,12 @@ class Nodes:
         citations: list[dict] = []
         number: dict[str, int] = {}
         segments: list[dict] = []
+        gaps: list[str] = []
         for verdict in kept:
+            if verdict.claim.kind == "gap":
+                gaps.append(verdict.claim.text)
+                segments.append(_segment(verdict.claim, []))
+                continue
             nums: list[int] = []
             for sid in verdict.claim.citations:
                 hit = hit_by_id.get(sid)
@@ -244,16 +309,18 @@ class Nodes:
                 nums.append(number[sid])
             nums = sorted(set(nums))
             if nums:
-                segments.append({"text": verdict.claim.text, "citations": nums})
+                segments.append(_segment(verdict.claim, nums))
 
-        if not segments:
+        if not any(s["kind"] != "gap" for s in segments):
+            if gaps:
+                reason = " ".join(gaps)
+            elif dropped:
+                reason = "every candidate claim failed verification against the sources"
+            else:
+                reason = "the documents do not contain enough information to answer this question"
             return {
                 "status": "refused",
-                "refusal_reason": (
-                    "every candidate claim failed verification against the sources"
-                    if verdicts
-                    else "the documents do not contain enough information to answer this question"
-                ),
+                "refusal_reason": reason,
                 "segments": [],
                 "citations": [],
                 "dropped_claims": len(dropped),
@@ -291,12 +358,31 @@ class Nodes:
         return "fail" if state.get("error") else "verify"
 
     def route_after_gate(self, state: GraphState) -> str:
-        return "generate" if state.get("relevant") else "refuse"
+        if state.get("relevant"):
+            return "generate"
+        signals = state.get("signals")
+        query = state.get("rewritten_question") or state["question"]
+        if (
+            not state.get("translated")
+            and self.s.llm.configured
+            and (signals is None or signals.lexical_top < 0.34)
+            and looks_foreign(query)
+        ):
+            return "translate"
+        return "refuse"
+
+    def route_after_translate(self, state: GraphState) -> str:
+        before = (state.get("rewritten_question") or state["question"]).strip().lower()
+        return "retrieve_and_gate" if (state.get("search_query") or "").strip().lower() != before else "refuse"
 
     def route_after_verify(self, state: GraphState) -> str:
+        """Retry (wider retrieval, fresh generation) only when NOTHING substantive survived
+        verification. A partly verified answer is shown as 'partial' instead: regenerating
+        it would double cost and latency and could replace good content with worse."""
         verdicts = state.get("verdicts") or []
         any_failed = any(not v.ok for v in verdicts)
-        if any_failed and (state.get("attempt") or 0) < self.s.settings.max_retries:
+        any_kept = any(v.ok and v.claim.kind != "gap" for v in verdicts)
+        if any_failed and not any_kept and (state.get("attempt") or 0) < self.s.settings.max_retries:
             return "retry_prepare"
         return "finalize_answer"
 
@@ -317,8 +403,16 @@ def build_graph(services):
 
     graph.set_entry_point("rewrite")
     graph.add_edge("rewrite", "retrieve_and_gate")
+    graph.add_node("translate", nodes.translate)
     graph.add_conditional_edges(
-        "retrieve_and_gate", nodes.route_after_gate, {"generate": "generate", "refuse": "refuse"}
+        "retrieve_and_gate",
+        nodes.route_after_gate,
+        {"generate": "generate", "translate": "translate", "refuse": "refuse"},
+    )
+    graph.add_conditional_edges(
+        "translate",
+        nodes.route_after_translate,
+        {"retrieve_and_gate": "retrieve_and_gate", "refuse": "refuse"},
     )
     graph.add_conditional_edges(
         "generate", nodes.route_after_generate, {"verify": "verify", "fail": "fail"}
@@ -335,16 +429,64 @@ def build_graph(services):
     return graph.compile()
 
 
+_KINDS = {"fact", "insight", "gap"}
+_FORMATS = {"paragraph", "bullet", "text"}
+
+
+def parse_segments(data: dict) -> list[Claim]:
+    """Model JSON -> claims. Accepts the current {"segments": [...]} shape and the older
+    {"claims": [...]} one (facts only)."""
+    raw_items = data.get("segments")
+    if raw_items is None:
+        raw_items = data.get("claims")
+    claims: list[Claim] = []
+    for raw in raw_items or []:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text", "")).strip()
+        if not text:
+            continue
+        kind = str(raw.get("kind", "fact")).strip().lower()
+        fmt = str(raw.get("format", "text")).strip().lower()
+        citations = [str(c).strip().strip("[]") for c in (raw.get("citations") or []) if c]
+        claims.append(
+            Claim(
+                text=text.lstrip("-•* ").strip() if fmt == "bullet" else text,
+                citations=citations,
+                kind=kind if kind in _KINDS else "fact",
+                format=fmt if fmt in _FORMATS else "text",
+            )
+        )
+    return claims
+
+
+def _segment(claim: Claim, citations: list[int]) -> dict:
+    return {"text": claim.text, "citations": citations, "kind": claim.kind, "format": claim.format}
+
+
 def render_answer(segments: list[dict]) -> str:
-    """'XXXX[1] YYYY[2]' — claims joined, each followed by its citation markers."""
-    parts = []
+    """Markdown answer: paragraphs and bullets as the model laid them out, every sentence
+    followed by its citation markers ('... 25 days.[1] That is above ...[1][2]')."""
+    out = ""
     for seg in segments:
         markers = "".join(f"[{n}]" for n in seg.get("citations", []))
-        parts.append(f"{seg['text']}{markers}")
-    return " ".join(parts)
+        piece = f"{seg['text']}{markers}"
+        fmt = seg.get("format", "text")
+        if not out:
+            out = f"- {piece}" if fmt == "bullet" else piece
+        elif fmt == "bullet":
+            out += f"\n- {piece}"
+        elif fmt == "paragraph" or out.split("\n")[-1].startswith("- "):
+            out += f"\n\n{piece}"
+        else:
+            out += f" {piece}"
+    return out
 
 
-async def answer_question(services, graph, *, owner_key: str, conversation_id: str, question: str) -> dict:
+async def answer_question(
+    services, graph, *, owner_key: str, conversation_id: str, question: str,
+    include_public: bool = False, style: str | None = None,
+) -> dict:
     request_id = uuid.uuid4().hex
     start = time.perf_counter()
     history = await asyncio.to_thread(services.conversations.recent_history, owner_key, conversation_id)
@@ -354,6 +496,8 @@ async def answer_question(services, graph, *, owner_key: str, conversation_id: s
         "owner_key": owner_key,
         "conversation_id": conversation_id,
         "question": question,
+        "style": (style or "").strip()[:200] or None,
+        "include_public": include_public,
         "history": history,
         "attempt": 0,
         "top_k": services.settings.top_k,
@@ -426,6 +570,7 @@ async def answer_question(services, graph, *, owner_key: str, conversation_id: s
         "status": status,
         "refusal_reason": final.get("refusal_reason"),
         "rewritten_question": final.get("rewritten_question"),
+        "answer": answer_text,
         "segments": segments,
         "citations": citations,
         "dropped_claims": final.get("dropped_claims", 0),
@@ -434,5 +579,19 @@ async def answer_question(services, graph, *, owner_key: str, conversation_id: s
             "tokens_in": final.get("tokens_in", 0),
             "tokens_out": final.get("tokens_out", 0),
             "cost_usd": round(final.get("cost_usd", 0.0), 6),
+            "timings_ms": stage_timings(final.get("node_ms") or {}, total_ms),
         },
     }
+
+
+# Stages in pipeline order. 'other' = loading history, saving messages and logs, graph overhead.
+STAGES = ("rewrite", "translate", "retrieve", "generate", "verify")
+
+
+def stage_timings(node_ms: dict, total_ms: float) -> dict:
+    """Per-stage wall time for the response: retrieve (embedding the question, keyword +
+    vector search, re-ranking), generate (the answer LLM call), verify (rule checks + the
+    judge LLM call). Stages that did not run are 0."""
+    out = {stage: round(float(node_ms.get(stage, 0.0)), 1) for stage in STAGES}
+    out["other"] = round(max(0.0, total_ms - sum(out.values())), 1)
+    return out
