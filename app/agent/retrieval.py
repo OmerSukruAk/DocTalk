@@ -198,7 +198,11 @@ _OVERVIEW = re.compile(
 _GENERIC = frozenset(
     "document documents doc docs file files pdf pdfs report reports text content contents whole entire "
     "uploaded give please short brief briefly quick quickly provide write explain tell main key points "
-    "simple simply detail detailed few sentences bullet bullets words paragraph".split()
+    "simple simply detail detailed few sentences bullet bullets words paragraph point points".split()
+    # counts and audiences are format, not topic: "in three bullets for a new employee"
+    + "one two three four five six seven eight nine ten".split()
+    + "new employee employees colleague colleagues manager managers team beginner beginners newcomer "
+    "newcomers executive executives customer customers everyone someone non technical".split()
 )
 
 
@@ -285,6 +289,13 @@ class RetrievalSignals:
     lexical_top: float = 0.0  # best coverage of the query's content words by a candidate chunk
     fused_top: float = 0.0
     overview: bool = False  # 'summarise the documents': coverage sample, gate bypassed
+    # Search funnel, reported to the user: how many chunks each stage found or kept.
+    keyword_found: int = 0  # BM25 candidates
+    vector_found: int = 0  # vector-search candidates
+    merged: int = 0  # unique chunks after RRF fusion
+    candidates: int = 0  # chunks passed to the re-ranker (or kept when it is off)
+    reranked: bool = False
+    kept_chunks: int = 0  # chunks whose sentences go to the model
 
 
 def hybrid_search(**kwargs) -> list[Hit]:
@@ -329,6 +340,7 @@ def hybrid_search_ex(
         sample = overview_chunks(bm25.all_documents(owner_key, conversation_id, include_public), max(top_k, 12))
         if sample:
             signals.overview = True
+            signals.kept_chunks = len(sample)
             scores = {c["id"]: 1.0 for c in sample}
             return _expand(sample, scores, sentences, documents, owner_key, include_public, 0), signals
 
@@ -351,6 +363,7 @@ def hybrid_search_ex(
             vector_ids = []
 
     fused = _rrf([r for r in (bm25_ids, vector_ids) if r])
+    signals.keyword_found, signals.vector_found, signals.merged = len(bm25_ids), len(vector_ids), len(fused)
     if not fused:
         return [], signals
     signals.fused_top = max(fused.values())
@@ -358,6 +371,7 @@ def hybrid_search_ex(
 
     chunk_docs = {c["id"]: c for c in chunks.get_many(owner_key, ranked_ids, include_public)}
     ordered = [chunk_docs[cid] for cid in ranked_ids if cid in chunk_docs]
+    signals.candidates = len(ordered)
 
     # Re-rank (cross-encoder scores (query, chunk)) or keep the fused order.
     if reranker.configured and ordered:
@@ -365,9 +379,11 @@ def hybrid_search_ex(
         chunk_scores: dict[str, float] = {c["id"]: s for c, s in ranked}
         ordered = [c for c, _ in ranked]
         signals.rerank_top = max(chunk_scores.values()) if chunk_scores else None
+        signals.reranked = True
     else:
         chunk_scores = {c["id"]: fused[c["id"]] for c in ordered}
         ordered = ordered[:top_k]
+    signals.kept_chunks = len(ordered)
 
     q_terms = content_terms(query)
     signals.lexical_top = max(

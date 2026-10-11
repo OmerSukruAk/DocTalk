@@ -16,6 +16,7 @@ persist the messages and emit one request_logs record."""
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import TypedDict
@@ -433,6 +434,11 @@ _KINDS = {"fact", "insight", "gap"}
 _FORMATS = {"paragraph", "bullet", "text"}
 
 
+# Sentence ids the model sometimes writes into the text itself ("... trigger [d_ab12:s28]."):
+# their digits would fail the numbers check, and they must never reach the user.
+_INLINE_ID = re.compile(r"\s*[\[(]?\b(d_[0-9a-z]+:s\d+)\b[\])]?", re.IGNORECASE)
+
+
 def parse_segments(data: dict) -> list[Claim]:
     """Model JSON -> claims. Accepts the current {"segments": [...]} shape and the older
     {"claims": [...]} one (facts only)."""
@@ -449,6 +455,12 @@ def parse_segments(data: dict) -> list[Claim]:
         kind = str(raw.get("kind", "fact")).strip().lower()
         fmt = str(raw.get("format", "text")).strip().lower()
         citations = [str(c).strip().strip("[]") for c in (raw.get("citations") or []) if c]
+        inline = _INLINE_ID.findall(text)
+        if inline:  # move them out of the text and into the citation list
+            text = _INLINE_ID.sub("", text).strip()
+            citations += [sid for sid in inline if sid not in citations]
+            if not text:
+                continue
         claims.append(
             Claim(
                 text=text.lstrip("-•* ").strip() if fmt == "bullet" else text,
@@ -540,9 +552,13 @@ async def answer_question(
     )
 
     dropped_reasons: list[str] = []
+    removed: list[dict] = []
     for verdict in final.get("verdicts", []) or []:
         if not verdict.ok:
-            dropped_reasons.extend(verdict.reasons or [verdict.stage_decided])
+            reasons = verdict.reasons or [verdict.stage_decided]
+            dropped_reasons.extend(reasons)
+            removed.append({"text": verdict.claim.text, "kind": verdict.claim.kind, "reasons": reasons,
+                            "checked_by": verdict.stage_decided})
 
     await asyncio.to_thread(
         services.request_logger.log,
@@ -581,7 +597,47 @@ async def answer_question(
             "cost_usd": round(final.get("cost_usd", 0.0), 6),
             "timings_ms": stage_timings(final.get("node_ms") or {}, total_ms),
         },
+        # Response only (not stored with the message): removed statements are unverified text.
+        "diagnostics": {
+            "search": search_stats(final),
+            "verification": verification_counts(final.get("verdicts") or []),
+            "removed": removed,
+            "translated_query": final.get("search_query") if final.get("translated") else None,
+            "attempts": (final.get("attempt") or 0) + 1,
+            "judge_calls": final.get("judge_calls", 0),
+        },
     }
+
+
+def search_stats(final: dict) -> dict | None:
+    """The retrieval funnel of the last attempt, for the answer's diagnostics."""
+    s = final.get("signals")
+    if s is None:
+        return None
+    hits = final.get("hits") or []
+    mode = "overview" if s.overview else ("hybrid" if s.vector_top is not None else "keyword")
+    return {
+        "mode": mode, "top_k": final.get("top_k") or 0,
+        "keyword_found": s.keyword_found, "vector_found": s.vector_found, "merged": s.merged,
+        "candidates": s.candidates, "reranked": s.reranked, "kept_chunks": s.kept_chunks,
+        "sentences": sum(1 for h in hits if not h.is_context),
+        "context_sentences": sum(1 for h in hits if h.is_context),
+        "gate_passed": final.get("relevant"),
+        "vector_top": s.vector_top, "rerank_top": s.rerank_top, "lexical_top": s.lexical_top,
+    }
+
+
+_DECIDED_BY = {"nli_fail": "nli"}  # NLI keeps ("nli") and removes ("nli_fail"): one check
+
+
+def verification_counts(verdicts: list) -> dict:
+    """Per check, how many statements of each kind it kept and removed (last attempt)."""
+    out: dict[str, dict] = {}
+    for v in verdicts:
+        check = out.setdefault(_DECIDED_BY.get(v.stage_decided, v.stage_decided), {"kept": {}, "removed": {}})
+        bucket = check["kept" if v.ok else "removed"]
+        bucket[v.claim.kind] = bucket.get(v.claim.kind, 0) + 1
+    return out
 
 
 # Stages in pipeline order. 'other' = loading history, saving messages and logs, graph overhead.

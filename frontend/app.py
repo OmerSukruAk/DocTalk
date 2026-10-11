@@ -99,7 +99,8 @@ def source_card(citation: dict, open_id: dict | None = None) -> html.Div:
             dmc.Button("Open in document", id=open_id, size="compact-xs", variant="subtle",
                        rightSection=icon("arrow-up-right", 12)) if open_id and not deleted else None,
         ], gap=8, wrap="nowrap"),
-        dmc.Text(location, size="xs", c="dimmed", mt=2) if location else None,
+        html.Div([html.Span(location) if location else None,
+                  html.Code(citation["sentence_id"], className="mono")], className="meta source-meta"),
         html.Blockquote(citation["text"], className="quote"),
     ], className="source")
 
@@ -174,7 +175,206 @@ def _metrics(m: dict | None) -> html.Div | None:
     ], className="meta")
 
 
-def assistant_body(msg: dict, m: int) -> list:
+_STATUS = {
+    "ok": ("teal", "circle-check", "Verified"),
+    "partial": ("yellow", "alert-circle", "Partly verified"),
+    "refused": ("gray", "circle-minus", "Refused"),
+    "error": ("red", "alert-triangle", "Error"),
+}
+_CHECKED_BY = {"rules": "rule check", "nli_fail": "NLI model", "judge": "LLM judge",
+               "judge_unavailable": "LLM judge unavailable", "gap": "gap check"}
+
+
+def _secs(ms: float | None) -> str:
+    if ms is None:
+        return ""
+    return f"{ms / 1000:.1f} s" if ms >= 100 else f"{ms:.0f} ms"
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _warnings(msg: dict) -> dmc.Alert | None:
+    """Anything the user should know about how this answer was produced."""
+    diag = msg.get("diagnostics") or {}
+    items = []
+    for r in diag.get("removed", []):
+        why = "; ".join(r.get("reasons") or []) or "not supported by the cited sources"
+        items.append(html.Li([
+            "Removed: ", html.Q(r["text"], className="removed-text"),
+            html.Div(f"{why} · {_CHECKED_BY.get(r.get('checked_by'), r.get('checked_by', ''))}", className="warn-why"),
+        ]))
+    if msg.get("status") == "partial" and not diag.get("removed"):  # saved answers keep only the status
+        items.append(html.Li("Some statements were removed because the documents did not support them."))
+    if diag.get("attempts", 1) > 1:
+        items.append(html.Li("Nothing could be verified on the first try, so DocTalk searched wider and "
+                             f"tried again ({diag['attempts']} attempts)."))
+    if diag.get("translated_query"):
+        items.append(html.Li(["The question was translated before searching: ", html.Q(diag["translated_query"])]))
+    deleted = [f"[{c['n']}]" for c in msg.get("citations") or [] if c.get("document_deleted")]
+    if deleted:
+        items.append(html.Li(f"Citation {', '.join(deleted)} points to a document that has since been deleted."))
+    if not items:
+        return None
+    return dmc.Alert(html.Ul(items, className="warn-list"), title=_plural(len(items), "warning"),
+                     color="yellow", variant="light", radius="lg", icon=icon("alert-triangle"))
+
+
+def _step(number: str, title: str, ms: float | None, detail=None, skipped: bool = False) -> html.Div:
+    return html.Div([
+        html.Div(number, className="step-num"),
+        html.Div([html.Div(title, className="step-title"),
+                  html.Div(detail, className="step-detail") if detail else None], className="step-body"),
+        html.Div("skipped" if skipped else _secs(ms), className="step-time"),
+    ], className="step step-skipped" if skipped else "step")
+
+
+def _lines(items: list) -> html.Ul:
+    return html.Ul([html.Li(i) for i in items if i], className="step-lines")
+
+
+def _pct(x: float | None) -> str:
+    return f"{x:.0%}" if x is not None else "–"
+
+
+def _search_lines(search: dict | None, attempts: int, cited: int, documents: int):
+    """The retrieval funnel in plain words: found → merged → re-ranked → kept → sentences."""
+    if not search:
+        return None
+    if search["mode"] == "overview":
+        lines = [f"Overview question: an even sample of {_plural(search['kept_chunks'], 'chunk')} from every section "
+                 "(no similarity search)"]
+    else:
+        found = f"Keyword search (BM25) found {_plural(search['keyword_found'], 'chunk')}"
+        found += (f" · vector search found {search['vector_found']}" if search["mode"] == "hybrid"
+                  else " · vector search off (no embeddings key)")
+        lines = [found, f"Merged (RRF) into {_plural(search['merged'], 'unique chunk')}"]
+        if search["reranked"]:
+            lines.append(f"Re-ranker scored the top {search['candidates']} and kept the best {search['kept_chunks']}")
+        else:
+            lines.append(f"Kept the top {search['kept_chunks']} (top-k = {search['top_k']}; no re-ranker configured)")
+        signals = [f"best similarity {search['vector_top']:.2f}" if search.get("vector_top") is not None else None,
+                   f"re-ranker {_pct(search['rerank_top'])}" if search.get("rerank_top") is not None else None,
+                   f"keyword match {_pct(search.get('lexical_top'))}"]
+        scores = " · ".join(x for x in signals if x)
+        lines.append(f"Relevance check passed: {scores}" if search.get("gate_passed") else
+                     f"Relevance check failed: {scores}, so nothing relevant enough to write an answer from")
+    if search.get("gate_passed") is not False:
+        extra = f" (+{search['context_sentences']} neighbours for context)" if search["context_sentences"] else ""
+        lines.append(f"{_plural(search['sentences'], 'sentence')}{extra} went to the writer; "
+                     f"{cited} cited from {_plural(documents, 'document')}")
+    if attempts > 1:
+        lines.append(f"Final attempt of {attempts}: the retry widened top-k to {search['top_k']}")
+    return _lines(lines)
+
+
+_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"))
+_CHECKS = (
+    ("rules", "Rule checks (citation ids, numbers, negations)"),
+    ("gap", "Gap check"),
+    ("nli", "NLI model"),
+    ("judge", "Judge agent (LLM)"),
+    ("judge_unavailable", "Judge agent unavailable"),
+)
+
+
+def _kinds(counts: dict) -> str:
+    return " · ".join(f"{counts[k]} {one if counts[k] == 1 else many}" for k, one, many in _KINDS if counts.get(k))
+
+
+def _check_lines(verification: dict | None):
+    """Who decided each statement: e.g. "Judge agent (LLM) kept 3 facts · 1 analysis; removed 1 fact"."""
+    if verification is None:
+        return None
+    lines = []
+    for key, label in _CHECKS:
+        if key == "rules" and key not in verification:
+            lines.append(f"{label}: all statements passed")
+            continue
+        counts = verification.get(key)
+        if not counts:
+            continue
+        parts = [f"kept {_kinds(counts['kept'])}" if counts.get("kept") else None,
+                 f"removed {_kinds(counts['removed'])}" if counts.get("removed") else None]
+        lines.append(f"{label} " + "; ".join(x for x in parts if x))
+    return _lines(lines)
+
+
+def _steps(msg: dict, question: str | None) -> list:
+    """The pipeline, one row per step: what it did and how long it took."""
+    t = (msg.get("metrics") or {}).get("timings_ms") or {}
+    metrics = msg.get("metrics") or {}
+    diag = msg.get("diagnostics") or {}
+    segments = msg.get("segments") or []
+    citations = msg.get("citations") or []
+    kinds = {k: sum(1 for s in segments if s.get("kind", "fact") == k) for k in ("fact", "insight", "gap")}
+    removed = len(diag.get("removed", [])) or msg.get("dropped_claims", 0)
+    documents = len({c["document_id"] for c in citations})
+    nothing_written = t.get("generate", 0) < 1  # refused by the relevance gate before any LLM call
+
+    rewritten = (msg.get("rewritten_question") or "").strip()
+    if rewritten and rewritten.lower() != (question or "").strip().lower():
+        understood = [html.Q(question or ""), " → ", html.Q(rewritten, className="rewritten")]
+    elif t.get("rewrite", 0) < 1:
+        understood = "First question in the chat: nothing to resolve"
+    else:
+        understood = "Clear on its own, used as asked"
+    rows = [_step("1", "Understanding the question", t.get("rewrite"), understood, skipped=t.get("rewrite", 0) < 1)]
+    if diag.get("translated_query"):
+        rows.append(_step("↳", "Translating the question", t.get("translate"),
+                          ["Searched as ", html.Q(diag["translated_query"])]))
+
+    found = _search_lines(diag.get("search"), diag.get("attempts", 1), len(citations), documents)
+    rows.append(_step("2", "Searching the documents", t.get("retrieve"), found or (
+        "Nothing relevant found" if nothing_written
+        else f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}")))
+    rows.append(_step("3", "Writing the answer", t.get("generate"),
+                      None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted",
+                      skipped=nothing_written))
+    checked = _check_lines(diag.get("verification")) or (
+        f"Kept {_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · "
+        f"{_plural(kinds['gap'], 'gap')} · removed {removed}")
+    rows.append(_step("4", "Fact-checking", t.get("verify"), None if nothing_written else checked,
+                      skipped=nothing_written))
+    if t.get("other", 0) >= 10:
+        rows.append(_step("", "Loading history, saving, logging", t["other"]))
+
+    tokens_in, tokens_out = metrics.get("tokens_in", 0), metrics.get("tokens_out", 0)
+    rows.append(html.Div([
+        html.Div("", className="step-num"),
+        html.Div([html.Div("Total", className="step-title"),
+                  html.Div(f"{tokens_in + tokens_out:,} tokens ({tokens_in:,} in / {tokens_out:,} out) · "
+                           f"${metrics.get('cost_usd', 0):.5f}", className="step-detail")], className="step-body"),
+        html.Div(_secs(metrics.get("total_ms", 0)), className="step-time"),
+    ], className="step step-total"))
+    return rows
+
+
+def answer_details(msg: dict, question: str | None) -> list:
+    """Status, warnings and the step-by-step pipeline for one answer."""
+    color, status_icon, status_label = _STATUS.get(msg.get("status", "ok"), _STATUS["ok"])
+    header = dmc.Group([
+        dmc.Badge(status_label, color=color, variant="light", leftSection=icon(status_icon, 12)),
+        html.Code(msg.get("message_id") or msg.get("id") or "", className="mono"),
+    ], justify="space-between")
+    if msg.get("metrics"):
+        return [header, _warnings(msg), html.Div(_steps(msg, question), className="steps")]
+    # saved answers keep their text, status and sources, not the per-step data
+    segments = msg.get("segments") or []
+    citations = msg.get("citations") or []
+    kinds = {k: sum(1 for s in segments if s.get("kind", "fact") == k) for k in ("fact", "insight", "gap")}
+    documents = len({c["document_id"] for c in citations})
+    return [
+        header, _warnings(msg),
+        dmc.Text(f"{_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · {_plural(kinds['gap'], 'gap')} · "
+                 f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}", size="sm"),
+        dmc.Text("Step times, tokens and warnings are shown for answers given in this session.",
+                 size="xs", c="dimmed"),
+    ]
+
+
+def assistant_body(msg: dict, m: int, question: str | None = None, show_details: bool = True) -> list:
     """`m` is the message's index in the chat; citation ids carry it so a click finds its source."""
     status = msg.get("status", "ok")
     if status in ("refused", "error"):
@@ -185,7 +385,7 @@ def assistant_body(msg: dict, m: int) -> list:
             color="gray" if refused else "nn",
             variant="light", radius="lg",
             icon=icon("file-search" if refused else "alert-triangle"),
-        ), _metrics(msg.get("metrics"))]
+        ), _extras(msg, question, show_details, []), None if show_details else _metrics(msg.get("metrics"))]
 
     citations = msg.get("citations") or []
     by_n = {c["n"]: c for c in citations}
@@ -203,26 +403,39 @@ def assistant_body(msg: dict, m: int) -> list:
         what = f"{dropped} statement{'s' if dropped != 1 else ''}" if dropped else "Some statements"
         notes.append(html.Div([icon("shield-check", 13), f"{what} removed: the documents did not support them."],
                               className="meta"))
-    if citations:
-        cards = [source_card(c, {"type": "cite", "m": m, "n": c["n"], "k": "src"}) for c in citations]
-        notes.append(dmc.Accordion(
-            dmc.AccordionItem([
-                dmc.AccordionControl(f"Sources · {len(citations)}", icon=icon("quote", 16)),
-                dmc.AccordionPanel(dmc.Stack(cards, gap="md")),
-            ], value="sources"),
-            variant="filled", radius="lg", chevronPosition="right", className="sources",
-        ))
-    return [*body, *notes, _metrics(msg.get("metrics"))]
+    cards = [source_card(c, {"type": "cite", "m": m, "n": c["n"], "k": "src"}) for c in citations]
+    footer = None if show_details else _metrics(msg.get("metrics"))  # the details panel already has it
+    return [*body, *notes, _extras(msg, question, show_details, cards), footer]
 
 
-def render_message(msg: dict, m: int) -> html.Div:
+def _extras(msg: dict, question: str | None, show_details: bool, cards: list):
+    """Collapsible "Sources" and "Answer details" under an answer."""
+    items = []
+    if cards:
+        items.append(dmc.AccordionItem([
+            dmc.AccordionControl(f"Sources · {len(cards)}", icon=icon("quote", 16)),
+            dmc.AccordionPanel(dmc.Stack(cards, gap="md")),
+        ], value="sources"))
+    if show_details:
+        items.append(dmc.AccordionItem([
+            dmc.AccordionControl("Answer details", icon=icon("list-details", 16)),
+            dmc.AccordionPanel(dmc.Stack(answer_details(msg, question), gap="md")),
+        ], value="details"))
+    if not items:
+        return None
+    return dmc.Accordion(items, multiple=True, value=[], variant="filled", radius="lg",
+                         chevronPosition="right", className="sources")
+
+
+def render_message(msg: dict, m: int, question: str | None = None, show_details: bool = True) -> html.Div:
     if msg.get("role") == "user":
         return html.Div(html.Div(msg.get("text", ""), className="bubble"), className="msg msg-user")
     mark = html.Div(icon("message-2", 16), className="mark")
     if msg.get("pending"):
         return html.Div([mark, html.Div([html.Span(), html.Span(), html.Span()], className="typing")],
                         className="msg msg-assistant")
-    return html.Div([mark, html.Div(assistant_body(msg, m), className="answer")], className="msg msg-assistant")
+    return html.Div([mark, html.Div(assistant_body(msg, m, question, show_details), className="answer")],
+                    className="msg msg-assistant")
 
 
 def empty_state() -> html.Div:
@@ -313,6 +526,8 @@ main = dmc.AppShellMain(html.Div([
                     dmc.TextInput(id="style", label="Answer style",
                                   placeholder="e.g. casual, executive summary, in Turkish"),
                     dmc.Switch(id="include-public", label="Also search shared public documents", size="sm"),
+                    dmc.Switch(id="show-details", label="Show answer details", size="sm", checked=True,
+                               persistence=True, persistence_type="local"),
                 ], gap="md", w=290)),
             ], position="top-start", offset=12),
             dmc.Textarea(id="question", placeholder="Ask about your documents…", autosize=True, minRows=1,
@@ -512,15 +727,24 @@ def show_documents(session, active, _version):
     except api.ApiError:
         return []
     return [
-        html.Div([
+        dmc.Tooltip(html.Div([
             icon(_FILE_ICONS.get(os.path.splitext(d["name"])[1].lower(), "file-text"), 16),
-            html.Span(d["name"], className="chip-name", title=d["name"]),
+            html.Span(d["name"], className="chip-name"),
             html.Span(f"{d['sentence_count']} sentences", className="chip-meta"),
             dmc.ActionIcon(icon("x", 12), id={"type": "doc-del", "id": d["id"]}, variant="subtle",
                            color="gray", size="sm"),
-        ], className="chip")
+        ], className="chip"), label=_doc_info(d), multiline=True, w=260, withArrow=True, openDelay=300)
         for d in docs
     ]
+
+
+def _doc_info(doc: dict) -> html.Div:
+    return html.Div([
+        html.Div(doc["name"], style={"fontWeight": 600}),
+        html.Div(f"{doc.get('type', '').upper()} · {doc['sentence_count']} citable sentences"),
+        html.Div(f"Uploaded {_stamp(doc.get('created_at'))}"),
+        html.Div(doc["id"], className="mono"),
+    ])
 
 
 def _ensure_conversation(token: str, active: str | None) -> tuple[str, bool]:
@@ -636,9 +860,15 @@ def answer(request, session, style, include_public, messages):
     return [*messages, {"role": "assistant", **reply}], no_update
 
 
-@app.callback(Output("chat", "children"), Input("messages", "data"))
-def show_chat(messages):
-    return [render_message(msg, m) for m, msg in enumerate(messages)] if messages else empty_state()
+@app.callback(Output("chat", "children"), Input("messages", "data"), Input("show-details", "checked"))
+def show_chat(messages, show_details):
+    if not messages:
+        return empty_state()
+
+    def asked(m: int) -> str | None:  # the user question an answer replies to
+        return messages[m - 1].get("text") if m and messages[m - 1].get("role") == "user" else None
+
+    return [render_message(msg, m, asked(m), bool(show_details)) for m, msg in enumerate(messages)]
 
 
 app.clientside_callback(

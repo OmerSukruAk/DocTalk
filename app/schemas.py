@@ -44,6 +44,47 @@ class AnswerMetrics(BaseModel):
     timings_ms: dict[str, float] = {}
 
 
+class RemovedStatement(BaseModel):
+    """A statement the verifier removed: NOT supported by the documents, shown only as a warning."""
+    text: str
+    kind: Literal["fact", "insight", "gap"] = "fact"
+    reasons: list[str] = []
+    checked_by: str                    # rules | nli_fail | judge | judge_unavailable | gap
+
+
+class SearchStats(BaseModel):
+    """The retrieval funnel of the last attempt: chunks found, merged, re-ranked, kept."""
+    mode: Literal["hybrid", "keyword", "overview"]
+    top_k: int
+    keyword_found: int = 0             # BM25 candidates
+    vector_found: int = 0              # vector-search candidates
+    merged: int = 0                    # unique chunks after RRF fusion
+    candidates: int = 0                # chunks sent to the re-ranker (or kept when it is off)
+    reranked: bool = False
+    kept_chunks: int = 0               # chunks whose sentences reach the model
+    sentences: int = 0                 # their sentences
+    context_sentences: int = 0         # neighbouring sentences added as context
+    gate_passed: bool | None = None
+    vector_top: float | None = None    # best cosine similarity
+    rerank_top: float | None = None    # best re-ranker probability
+    lexical_top: float | None = None   # best share of the question's content words found
+
+
+class CheckCounts(BaseModel):
+    kept: dict[str, int] = {}          # statement kind (fact / insight / gap) -> count
+    removed: dict[str, int] = {}
+
+
+class AnswerDiagnostics(BaseModel):
+    search: SearchStats | None = None
+    # who decided each statement: rules | gap | nli | judge | judge_unavailable
+    verification: dict[str, CheckCounts] = {}
+    removed: list[RemovedStatement] = []
+    translated_query: str | None = None  # the question translated into the documents' language
+    attempts: int = 1                    # 2 = nothing verified at first, retried with a wider search
+    judge_calls: int = 0                 # statements the LLM judge had to decide
+
+
 class AskRequest(BaseModel):
     question: str
     style: str | None = None  # optional tone / format, e.g. "casual", "executive summary", "in Turkish"
@@ -60,6 +101,7 @@ class AskResponse(BaseModel):
     citations: list[Citation]
     dropped_claims: int = 0
     metrics: AnswerMetrics
+    diagnostics: AnswerDiagnostics = AnswerDiagnostics()
 
 
 class DocumentInfo(BaseModel):

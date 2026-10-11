@@ -69,6 +69,7 @@ def test_offtopic_question_is_stopped_by_the_gate_with_zero_llm_tokens(ready):
     r = ask(svc, cid, "What is the capital of France?")
     assert r["status"] == "refused" and "no relevant content" in r["refusal_reason"]
     assert r["metrics"]["tokens_in"] == 0 and len(svc.llm.calls) == before
+    assert r["diagnostics"]["search"]["gate_passed"] is False
 
 
 def test_foreign_language_question_is_translated_once_then_answered(ready):
@@ -101,6 +102,27 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     r = ask(svc, cid, "How many sick leave days do I get?")
     assert r["status"] == "partial" and r["dropped_claims"] == 1
     assert all("99" not in s["text"] for s in r["segments"])
+    # the removed statement and why it was removed are reported, but never as part of the answer
+    removed = r["diagnostics"]["removed"]
+    assert [d["text"] for d in removed] == ["Sick leave is 99 days per year."]
+    assert removed[0]["reasons"] and removed[0]["checked_by"]
+    assert r["diagnostics"]["attempts"] == 1
+    # the search funnel and who decided each statement are reported too
+    search = r["diagnostics"]["search"]
+    assert search["kept_chunks"] > 0 and search["sentences"] > 0 and search["gate_passed"] is True
+    assert r["diagnostics"]["verification"]["rules"]["removed"] == {"fact": 1}
+
+
+def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
+    svc, cid, _ = ready
+    sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
+    # the model put the id in the text and left the citation list empty: its digits must not
+    # fail the numbers check, and the id must not be shown to the user
+    svc.llm.extra_claims = [{"text": f"Sick leave is 10 days per year [{sid}].", "citations": []}]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    assert r["dropped_claims"] == 0
+    assert all("d_" not in s["text"] for s in r["segments"])
+    assert any(s["text"] == "Sick leave is 10 days per year." and s["citations"] for s in r["segments"])
 
 
 def test_invented_citation_id_is_rejected(ready):
