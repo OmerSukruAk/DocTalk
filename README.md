@@ -42,6 +42,7 @@ Open **<http://localhost:8050>**, paste the token, drop in `eval/docs/hr_policy.
 | CLI demo (uploads, asks six questions, prints citations) | `python scripts/doctalk_cli.py demo eval/docs/hr_policy.md eval/docs/it_security.md` |
 | Interactive CLI | `python scripts/doctalk_cli.py chat <files…>` |
 | Swagger UI | <http://localhost:8000/docs>: get a token as above, click *Authorize* |
+| MongoDB and Qdrant already running on this machine (:6335, :6333): start only the issuer, API and web UI | `docker compose -f docker-compose.local.yml up --build` |
 | Web UI without Docker (API already running) | `pip install -r frontend/requirements.txt && python frontend/app.py` |
 | Tests (offline, no keys, ~20 s) | `pip install -r requirements-dev.txt && pytest` |
 | Evaluation (needs an LLM key) | `python eval/run_eval.py` → `eval/report.md` |
@@ -97,6 +98,7 @@ Two ideas carry the design.
    | `fact` | what the documents say, paraphrased | cited ids exist · every number appears in the cited text · no invented negation · NLI model or LLM judge: entailed |
    | `insight` | DocTalk's own analysis: trend, comparison, calculation | must cite the facts it builds on · judge: reasonable inference, correct arithmetic, no outside facts |
    | `gap` | "the documents don't cover X" | short, no citations, no facts |
+   | `framing` | what a requested format needs: greeting, sign-off, heading, lead-in | no citations · at most 15 words · no numbers or negations · must not restate the documents |
 
 Anything that fails is removed **before** the user sees it. All undecided segments go to the LLM
 judge in one batched call. The UI tints insights so analysis is never mistaken for document text.

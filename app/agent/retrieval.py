@@ -7,6 +7,7 @@ deterministic and runs before any LLM call, so an unanswerable question costs ze
 tokens."""
 
 from __future__ import annotations
+import logging
 import math
 import re
 import threading
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from rank_bm25 import BM25Plus
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 from app.config import Settings
+
+logger = logging.getLogger("doctalk")
 
 
 # --- BM25 ---
@@ -374,8 +377,13 @@ def hybrid_search_ex(
     signals.candidates = len(ordered)
 
     # Re-rank (cross-encoder scores (query, chunk)) or keep the fused order.
+    ranked = None
     if reranker.configured and ordered:
-        ranked = reranker.rerank(query, ordered, top_k)
+        try:
+            ranked = reranker.rerank(query, ordered, top_k)
+        except Exception as exc:  # model could not load: answer from the fused order instead
+            logger.warning("Re-ranker unavailable, using the fused order: %s", exc)
+    if ranked is not None:
         chunk_scores: dict[str, float] = {c["id"]: s for c, s in ranked}
         ordered = [c for c, _ in ranked]
         signals.rerank_top = max(chunk_scores.values()) if chunk_scores else None

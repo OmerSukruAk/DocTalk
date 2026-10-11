@@ -269,10 +269,12 @@ def _search_lines(search: dict | None, attempts: int, cited: int, documents: int
     return _lines(lines)
 
 
-_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"))
+_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"),
+          ("framing", "framing", "framing"))
 _CHECKS = (
     ("rules", "Rule checks (citation ids, numbers, negations)"),
     ("gap", "Gap check"),
+    ("framing", "Framing check (greetings, headings: no information allowed)"),
     ("nli", "NLI model"),
     ("judge", "Judge agent (LLM)"),
     ("judge_unavailable", "Judge agent unavailable"),
@@ -330,7 +332,8 @@ def _steps(msg: dict, question: str | None) -> list:
         "Nothing relevant found" if nothing_written
         else f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}")))
     rows.append(_step("3", "Writing the answer", t.get("generate"),
-                      None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted",
+                      None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted"
+                      + (f" in the requested style: “{msg['style']}”" if msg.get("style") else ""),
                       skipped=nothing_written))
     checked = _check_lines(diag.get("verification")) or (
         f"Kept {_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · "
@@ -360,7 +363,7 @@ def answer_details(msg: dict, question: str | None) -> list:
     ], justify="space-between")
     if msg.get("metrics"):
         return [header, _warnings(msg), html.Div(_steps(msg, question), className="steps")]
-    # saved answers keep their text, status and sources, not the per-step data
+    # answers saved before the details were stored keep their text, status and sources only
     segments = msg.get("segments") or []
     citations = msg.get("citations") or []
     kinds = {k: sum(1 for s in segments if s.get("kind", "fact") == k) for k in ("fact", "insight", "gap")}
@@ -369,7 +372,7 @@ def answer_details(msg: dict, question: str | None) -> list:
         header, _warnings(msg),
         dmc.Text(f"{_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · {_plural(kinds['gap'], 'gap')} · "
                  f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}", size="sm"),
-        dmc.Text("Step times, tokens and warnings are shown for answers given in this session.",
+        dmc.Text("Step times, tokens and warnings were not saved for this older answer.",
                  size="xs", c="dimmed"),
     ]
 
@@ -401,7 +404,8 @@ def assistant_body(msg: dict, m: int, question: str | None = None, show_details:
     if status == "partial":
         dropped = msg.get("dropped_claims")
         what = f"{dropped} statement{'s' if dropped != 1 else ''}" if dropped else "Some statements"
-        notes.append(html.Div([icon("shield-check", 13), f"{what} removed: the documents did not support them."],
+        them = "it" if dropped == 1 else "them"
+        notes.append(html.Div([icon("shield-check", 13), f"{what} removed: the documents did not support {them}."],
                               className="meta"))
     cards = [source_card(c, {"type": "cite", "m": m, "n": c["n"], "k": "src"}) for c in citations]
     footer = None if show_details else _metrics(msg.get("metrics"))  # the details panel already has it
@@ -518,6 +522,7 @@ main = dmc.AppShellMain(html.Div([
     ], className="docs"),
     html.Div(id="chat", className="chat"),
     html.Div([
+        html.Div(id="style-badge", className="style-badge-row"),
         html.Div([
             dmc.Popover([
                 dmc.PopoverTarget(dmc.ActionIcon(icon("adjustments-horizontal", 18), variant="subtle",
@@ -857,7 +862,7 @@ def answer(request, session, style, include_public, messages):
                         bool(include_public))
     except api.ApiError as exc:
         return messages, api_error(exc)
-    return [*messages, {"role": "assistant", **reply}], no_update
+    return [*messages, {"role": "assistant", **reply, "style": (style or "").strip() or None}], no_update
 
 
 @app.callback(Output("chat", "children"), Input("messages", "data"), Input("show-details", "checked"))
@@ -877,6 +882,25 @@ app.clientside_callback(
     Output("scroll-sink", "children"),
     Input("chat", "children"),
 )
+
+
+@app.callback(Output("style-badge", "children"), Input("style", "value"))
+def show_style(style):
+    """While a style is set, show it above the message box, with an x to clear it."""
+    style = (style or "").strip()
+    if not style:
+        return None
+    return dmc.Badge(
+        [icon("wand", 12), f" Answer style: {style}"], variant="light", radius="xl", size="lg", tt="none",
+        rightSection=dmc.ActionIcon(icon("x", 12), id="style-clear", variant="transparent", size="xs", color="nn"),
+        className="style-badge",
+    )
+
+
+@app.callback(Output("style", "value", allow_duplicate=True), Input("style-clear", "n_clicks"),
+              prevent_initial_call=True)
+def clear_style(clicks):
+    return "" if clicks else no_update
 
 
 # --- source viewer ------------------------------------------------------------------------------

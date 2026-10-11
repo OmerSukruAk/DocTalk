@@ -1,0 +1,34 @@
+# docker compose -f docker-compose.local.yml up --build
+# For when MongoDB (:6335) and Qdrant (:6333) already run on this machine: starts only the token
+# issuer, the API and the web UI. Values under `environment` override the localhost addresses in .env.
+services:
+  dev-issuer:                       # demo-only Entra stand-in (token API)
+    build: ./dev_issuer
+    environment:
+      DEV_ISSUER: http://localhost:9000     # must equal the API's DEV_ISSUER (the token's "iss")
+      DEV_AUDIENCE: doctalk-dev
+    ports: ["9000:9000"]
+
+  api:
+    build:
+      context: .
+      args: { WITH_ML: "1" }        # torch + sentence-transformers for RERANK_MODEL; or drop this and set RERANK_MODEL: ""
+    env_file: .env                  # LLM and embedding keys
+    environment:
+      MONGO_URI: mongodb://host.docker.internal:6335/?directConnection=true
+      QDRANT_URL: http://host.docker.internal:6333
+      DEV_ISSUER_JWKS_URL: http://dev-issuer:9000/jwks.json
+      DEV_ISSUER: http://localhost:9000
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["hf-cache:/home/doctalk/.cache/huggingface"]   # keep downloaded models between runs
+    ports: ["8000:8000"]
+    depends_on: [dev-issuer]
+
+  frontend:
+    build: ./frontend
+    environment:
+      API_URL: http://api:8000
+    ports: ["8050:8050"]
+    depends_on: [api]
+
+volumes: { hf-cache: {} }

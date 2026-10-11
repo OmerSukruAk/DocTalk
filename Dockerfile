@@ -8,7 +8,8 @@ ARG WITH_ML=0
 COPY requirements-ml.txt .
 RUN if [ "$WITH_ML" = "1" ]; then pip install --no-cache-dir -r requirements-ml.txt; fi
 COPY app ./app
-RUN useradd -u 10001 -m doctalk && mkdir -p /data/files && chown -R doctalk /data
+# the model cache exists and belongs to doctalk, so a volume mounted there is writable
+RUN useradd -u 10001 -m doctalk && mkdir -p /data/files /home/doctalk/.cache/huggingface \n    && chown -R doctalk /data /home/doctalk/.cache
 USER doctalk
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"

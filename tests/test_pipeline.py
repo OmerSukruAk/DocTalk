@@ -113,6 +113,21 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     assert r["diagnostics"]["verification"]["rules"]["removed"] == {"fact": 1}
 
 
+def test_answer_details_are_stored_with_the_message_but_never_reach_the_model(ready):
+    svc, cid, _ = ready
+    sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
+    svc.llm.extra_claims = [{"text": "Sick leave is 99 days per year.", "citations": [sid]}]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    saved = svc.conversations.list_messages(OWNER, cid)[-1]
+    # reopening the conversation shows the same details as the live answer
+    for key in ("metrics", "diagnostics", "dropped_claims"):
+        assert saved[key] == r[key]
+    assert saved["diagnostics"]["removed"][0]["text"] == "Sick leave is 99 days per year."
+    # the history the model sees is role and text only: the removed statement is not in it
+    history = svc.conversations.recent_history(OWNER, cid)
+    assert all(set(m) == {"role", "text"} and "99" not in m["text"] for m in history)
+
+
 def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
     svc, cid, _ = ready
     sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
@@ -123,6 +138,18 @@ def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
     assert r["dropped_claims"] == 0
     assert all("d_" not in s["text"] for s in r["segments"])
     assert any(s["text"] == "Sick leave is 10 days per year." and s["citations"] for s in r["segments"])
+
+
+def test_framing_is_kept_but_a_claim_disguised_as_framing_is_removed(ready):
+    svc, cid, _ = ready
+    svc.llm.extra_claims = [
+        {"text": "Dear Anna,", "kind": "framing", "format": "paragraph"},
+        {"text": "Sick leave is unlimited.", "kind": "framing"},      # a claim, not framing
+    ]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    texts = [s["text"] for s in r["segments"]]
+    assert "Dear Anna," in texts and "Sick leave is unlimited." not in texts
+    assert r["diagnostics"]["verification"]["framing"] == {"kept": {"framing": 1}, "removed": {"framing": 1}}
 
 
 def test_invented_citation_id_is_rejected(ready):
@@ -160,6 +187,24 @@ def test_users_are_isolated(ready):
     other = svc.conversations.create("tid:bob")
     r = ask(svc, other, "How many sick leave days do I get?", owner="tid:bob")
     assert r["status"] == "refused" and r["citations"] == []
+
+
+def test_reranker_that_cannot_load_falls_back_to_the_fused_order(ready):
+    svc, cid, _ = ready
+
+    class BrokenReRanker:
+        configured = True
+
+        def candidates(self, top_k):
+            return top_k * 2
+
+        def rerank(self, query, chunks, top_k):
+            raise PermissionError("model cache not writable")
+
+    svc.reranker = BrokenReRanker()
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    assert r["status"] in ("ok", "partial") and r["citations"]
+    assert r["diagnostics"]["search"]["reranked"] is False
 
 
 def test_bm25_only_degraded_mode_still_answers_and_gates(settings, services, hr_doc):

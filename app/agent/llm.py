@@ -171,6 +171,10 @@ OUTPUT: the answer as an ordered list of segments (one sentence or one bullet ea
                       facts it builds on. Show the inputs of any calculation.
 - "kind": "gap"     - one short sentence saying what the documents do NOT cover, only when
                       part of the question cannot be answered. No citations.
+- "kind": "framing" - only what the requested format itself needs: a greeting ("Dear Anna,"),
+                      a sign-off ("Kind regards"), a heading, or a short lead-in ending in ":".
+                      It must carry NO information: no facts, numbers or claims. No citations.
+                      Every piece of information goes in fact / insight segments.
 - "format": "paragraph" (starts a new paragraph), "bullet" (a bullet point) or "text"
             (continues the current paragraph).
 Rules:
@@ -181,7 +185,7 @@ Rules:
 {_UNTRUSTED_NOTE}
 
 Return STRICT JSON:
-{{"segments": [{{"text": "...", "kind": "fact|insight|gap", "format": "paragraph|bullet|text", "citations": ["<sentence_id>", ...]}}]}}"""
+{{"segments": [{{"text": "...", "kind": "fact|insight|gap|framing", "format": "paragraph|bullet|text", "citations": ["<sentence_id>", ...]}}]}}"""
 
 GENERATE_USER = """Conversation so far (context only, not a source of facts):
 {history}

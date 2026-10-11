@@ -30,7 +30,8 @@ class Citation(BaseModel):
 class AnswerSegment(BaseModel):
     text: str
     citations: list[int]               # -> Citation.n, rendered as [1][2]
-    kind: Literal["fact", "insight", "gap"] = "fact"  # insight = assistant's grounded commentary
+    kind: Literal["fact", "insight", "gap", "framing"] = "fact"  # insight = assistant's grounded commentary;
+    # framing = greeting / sign-off / heading a requested format needs, with no information
     format: Literal["paragraph", "bullet", "text"] = "text"
 
 
@@ -47,9 +48,9 @@ class AnswerMetrics(BaseModel):
 class RemovedStatement(BaseModel):
     """A statement the verifier removed: NOT supported by the documents, shown only as a warning."""
     text: str
-    kind: Literal["fact", "insight", "gap"] = "fact"
+    kind: Literal["fact", "insight", "gap", "framing"] = "fact"
     reasons: list[str] = []
-    checked_by: str                    # rules | nli_fail | judge | judge_unavailable | gap
+    checked_by: str                    # rules | nli_fail | judge | judge_unavailable | gap | framing
 
 
 class SearchStats(BaseModel):
@@ -77,7 +78,7 @@ class CheckCounts(BaseModel):
 
 class AnswerDiagnostics(BaseModel):
     search: SearchStats | None = None
-    # who decided each statement: rules | gap | nli | judge | judge_unavailable
+    # who decided each statement: rules | gap | framing | nli | judge | judge_unavailable
     verification: dict[str, CheckCounts] = {}
     removed: list[RemovedStatement] = []
     translated_query: str | None = None  # the question translated into the documents' language
@@ -100,6 +101,7 @@ class AskResponse(BaseModel):
     segments: list[AnswerSegment]
     citations: list[Citation]
     dropped_claims: int = 0
+    style: str | None = None            # the answer style it was written in, if any
     metrics: AnswerMetrics
     diagnostics: AnswerDiagnostics = AnswerDiagnostics()
 
