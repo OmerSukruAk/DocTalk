@@ -101,6 +101,7 @@ class AskResponse(BaseModel):
     segments: list[AnswerSegment]
     citations: list[Citation]
     dropped_claims: int = 0
+    style: str | None = None            # the answer style it was written in, if any
     metrics: AnswerMetrics
     diagnostics: AnswerDiagnostics = AnswerDiagnostics()
 
