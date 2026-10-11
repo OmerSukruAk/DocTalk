@@ -89,3 +89,26 @@ def test_framing_is_kept_only_when_it_carries_no_information():
     assert check_framing("You get 25 days.", sources)                   # a number
     assert check_framing("You cannot do that.", sources)                # a negation
     assert check_framing(" ".join(["word"] * 16), sources)              # too long
+
+
+PLANETS = {
+    "v": {"sentence_id": "v", "document_name": "d", "text": "Venus has a surface temperature of about 465 °C."},
+    "m": {"sentence_id": "m", "document_name": "d", "text": "Mercury reaches 430 °C by day and -180 °C at night."},
+}
+
+
+def test_a_number_repeated_from_another_cited_source_goes_to_the_judge_with_that_source():
+    llm = _Judge()
+    claims = [
+        Claim("Venus is about 465 °C at the surface.", ["v"]),
+        Claim("Mercury swings from 430 °C to -180 °C, so it averages far below Venus's 465 °C.", ["m"]),
+        Claim("Mercury averages 200 °C.", ["m"]),  # 200 is in no source of the answer
+    ]
+    venus, compare, invented = asyncio.run(
+        verify_claims(claims, context_by_id=PLANETS, nli=_NLI(0.95), llm=llm, nli_pass=0.8, nli_fail=0.2)
+    )
+    assert venus.ok and venus.stage_decided == "nli"
+    # kept by the judge, not NLI, and now also cites the source the 465 came from
+    assert compare.ok and compare.stage_decided == "judge" and compare.claim.citations == ["m", "v"]
+    assert llm.calls == 1
+    assert not invented.ok and invented.stage_decided == "rules"
