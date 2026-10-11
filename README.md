@@ -95,7 +95,7 @@ Two ideas carry the design.
 
    | Kind | Meaning | Checked by |
    |---|---|---|
-   | `fact` | what the documents say, paraphrased | cited ids exist · every number appears in the cited text · no invented negation · NLI model or LLM judge: entailed |
+   | `fact` | what the documents say, paraphrased | cited ids exist · every number appears in the cited text (or in a source another statement of the answer cites: that source is added to its citations and the judge decides) · no invented negation · NLI model or LLM judge: entailed |
    | `insight` | DocTalk's own analysis: trend, comparison, calculation | must cite the facts it builds on · judge: reasonable inference, correct arithmetic, no outside facts |
    | `gap` | "the documents don't cover X" | short, no citations, no facts |
    | `framing` | what a requested format needs: greeting, sign-off, heading, lead-in | no citations · at most 15 words · no numbers or negations · must not restate the documents |
@@ -121,7 +121,7 @@ is returned) · `refused` (not in the documents, with the reason) · `error` (LL
 | Search | BM25 + vectors, fused with RRF → optional cross-encoder re-ranker → expanded to sentences and neighbours | Exact terms and paraphrases both work |
 | Generation context | Retrieved sentences shown as passages grouped by document and section, each tagged `[id]`, plus the recent conversation | Coherent context; follow-ups and "make it shorter" work |
 
-### Relevance gate (decides before any LLM call)
+### Relevance gate (decides before the answer is written)
 
 The gate uses absolute signals: the cross-encoder probability, the best cosine similarity, or (in
 keyword-only mode) how many of the question's content words appear. It refuses only when **every**
@@ -143,8 +143,9 @@ refused. Thresholds are the `GATE_MIN_*` settings in `.env`; tune them with `eva
   warnings, such as each statement the verifier removed and why, a retry or a translation; then the
   pipeline step by step with the time each step took: how the question was understood; the search
   funnel (chunks found by keyword and vector search, merged, re-ranked, kept, and the relevance
-  scores); and which check kept or removed each fact, analysis or gap (rules, NLI model, judge
-  agent); plus tokens in and out, and cost.
+  scores); and which check kept or removed each fact, analysis, gap or framing (rules, NLI model,
+  judge agent); plus tokens in and out, and cost. The details are saved with the answer, so they
+  are still there when a conversation is reopened.
 - Optional answer style ("casual", "executive summary", "in Turkish"); light and dark mode; works on
   phones.
 
@@ -228,7 +229,7 @@ Cost figures use the prices set in `.env`.
 ```
 app/          FastAPI backend: routers/, agent/ (ingestion, retrieval, verification, workflow), repositories/
 frontend/     web UI, its own container: app.py, api.py (HTTP client), viewer.py (source viewer), theme.py
-tests/        56 offline tests (real workflow, in-memory MongoDB and Qdrant, fake LLM)
+tests/        62 offline tests (real workflow, in-memory MongoDB and Qdrant, fake LLM)
 eval/         evaluation harness, 17-question dataset, sample documents
 scripts/      command-line client
 dev_issuer/   local stand-in for Entra ID (demo only)
