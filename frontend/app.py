@@ -230,6 +230,77 @@ def _step(number: str, title: str, ms: float | None, detail=None, skipped: bool 
     ], className="step step-skipped" if skipped else "step")
 
 
+def _lines(items: list) -> html.Ul:
+    return html.Ul([html.Li(i) for i in items if i], className="step-lines")
+
+
+def _pct(x: float | None) -> str:
+    return f"{x:.0%}" if x is not None else "–"
+
+
+def _search_lines(search: dict | None, attempts: int, cited: int, documents: int):
+    """The retrieval funnel in plain words: found → merged → re-ranked → kept → sentences."""
+    if not search:
+        return None
+    if search["mode"] == "overview":
+        lines = [f"Overview question: an even sample of {_plural(search['kept_chunks'], 'chunk')} from every section "
+                 "(no similarity search)"]
+    else:
+        found = f"Keyword search (BM25) found {_plural(search['keyword_found'], 'chunk')}"
+        found += (f" · vector search found {search['vector_found']}" if search["mode"] == "hybrid"
+                  else " · vector search off (no embeddings key)")
+        lines = [found, f"Merged (RRF) into {_plural(search['merged'], 'unique chunk')}"]
+        if search["reranked"]:
+            lines.append(f"Re-ranker scored the top {search['candidates']} and kept the best {search['kept_chunks']}")
+        else:
+            lines.append(f"Kept the top {search['kept_chunks']} (top-k = {search['top_k']}; no re-ranker configured)")
+        signals = [f"best similarity {search['vector_top']:.2f}" if search.get("vector_top") is not None else None,
+                   f"re-ranker {_pct(search['rerank_top'])}" if search.get("rerank_top") is not None else None,
+                   f"keyword match {_pct(search.get('lexical_top'))}"]
+        scores = " · ".join(x for x in signals if x)
+        lines.append(f"Relevance check passed: {scores}" if search.get("gate_passed") else
+                     f"Relevance check failed: {scores}, so nothing relevant enough to write an answer from")
+    if search.get("gate_passed") is not False:
+        extra = f" (+{search['context_sentences']} neighbours for context)" if search["context_sentences"] else ""
+        lines.append(f"{_plural(search['sentences'], 'sentence')}{extra} went to the writer; "
+                     f"{cited} cited from {_plural(documents, 'document')}")
+    if attempts > 1:
+        lines.append(f"Final attempt of {attempts}: the retry widened top-k to {search['top_k']}")
+    return _lines(lines)
+
+
+_KINDS = (("fact", "fact", "facts"), ("insight", "analysis", "analysis"), ("gap", "gap", "gaps"))
+_CHECKS = (
+    ("rules", "Rule checks (citation ids, numbers, negations)"),
+    ("gap", "Gap check"),
+    ("nli", "NLI model"),
+    ("judge", "Judge agent (LLM)"),
+    ("judge_unavailable", "Judge agent unavailable"),
+)
+
+
+def _kinds(counts: dict) -> str:
+    return " · ".join(f"{counts[k]} {one if counts[k] == 1 else many}" for k, one, many in _KINDS if counts.get(k))
+
+
+def _check_lines(verification: dict | None):
+    """Who decided each statement: e.g. "Judge agent (LLM) kept 3 facts · 1 analysis; removed 1 fact"."""
+    if verification is None:
+        return None
+    lines = []
+    for key, label in _CHECKS:
+        if key == "rules" and key not in verification:
+            lines.append(f"{label}: all statements passed")
+            continue
+        counts = verification.get(key)
+        if not counts:
+            continue
+        parts = [f"kept {_kinds(counts['kept'])}" if counts.get("kept") else None,
+                 f"removed {_kinds(counts['removed'])}" if counts.get("removed") else None]
+        lines.append(f"{label} " + "; ".join(x for x in parts if x))
+    return _lines(lines)
+
+
 def _steps(msg: dict, question: str | None) -> list:
     """The pipeline, one row per step: what it did and how long it took."""
     t = (msg.get("metrics") or {}).get("timings_ms") or {}
@@ -254,18 +325,16 @@ def _steps(msg: dict, question: str | None) -> list:
         rows.append(_step("↳", "Translating the question", t.get("translate"),
                           ["Searched as ", html.Q(diag["translated_query"])]))
 
-    found = ("Nothing relevant found" if nothing_written
-             else f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}")
-    if diag.get("attempts", 1) > 1:
-        found += f" · {diag['attempts']} attempts"
-    rows.append(_step("2", "Searching the documents", t.get("retrieve"), found))
+    found = _search_lines(diag.get("search"), diag.get("attempts", 1), len(citations), documents)
+    rows.append(_step("2", "Searching the documents", t.get("retrieve"), found or (
+        "Nothing relevant found" if nothing_written
+        else f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}")))
     rows.append(_step("3", "Writing the answer", t.get("generate"),
                       None if nothing_written else f"{_plural(len(segments) + removed, 'statement')} drafted",
                       skipped=nothing_written))
-    checked = (f"Kept {_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · "
-               f"{_plural(kinds['gap'], 'gap')} · removed {removed}")
-    if diag.get("judge_calls"):
-        checked += f" · LLM judge decided {diag['judge_calls']}"
+    checked = _check_lines(diag.get("verification")) or (
+        f"Kept {_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · "
+        f"{_plural(kinds['gap'], 'gap')} · removed {removed}")
     rows.append(_step("4", "Fact-checking", t.get("verify"), None if nothing_written else checked,
                       skipped=nothing_written))
     if t.get("other", 0) >= 10:

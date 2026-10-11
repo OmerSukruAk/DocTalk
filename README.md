@@ -139,8 +139,10 @@ refused. Thresholds are the `GATE_MIN_*` settings in `.env`; tune them with `eva
 - Insights are tinted, and refusals and removed statements are clearly marked.
 - *Answer details* under each answer (can be switched off in the settings): the verification status;
   warnings, such as each statement the verifier removed and why, a retry or a translation; then the
-  pipeline step by step (understanding the question, searching, writing, fact-checking) with the
-  time each step took, tokens in and out, and cost.
+  pipeline step by step with the time each step took: how the question was understood; the search
+  funnel (chunks found by keyword and vector search, merged, re-ranked, kept, and the relevance
+  scores); and which check kept or removed each fact, analysis or gap (rules, NLI model, judge
+  agent); plus tokens in and out, and cost.
 - Optional answer style ("casual", "executive summary", "in Turkish"); light and dark mode; works on
   phones.
 
