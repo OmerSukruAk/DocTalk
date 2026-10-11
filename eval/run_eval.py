@@ -71,7 +71,7 @@ def evaluate(client: httpx.Client, dataset: list[dict], conversation_id: str | N
         seg_ok = []
         for seg in resp.get("segments", []):
             kind = seg.get("kind", "fact")
-            if kind == "gap":
+            if kind in ("gap", "framing"):
                 continue
             cited_text = " ".join(cites[n]["text"] for n in seg["citations"] if n in cites)
             nums = {_norm_num(n) for n in NUM.findall(seg["text"])}

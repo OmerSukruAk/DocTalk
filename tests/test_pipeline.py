@@ -125,6 +125,18 @@ def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
     assert any(s["text"] == "Sick leave is 10 days per year." and s["citations"] for s in r["segments"])
 
 
+def test_framing_is_kept_but_a_claim_disguised_as_framing_is_removed(ready):
+    svc, cid, _ = ready
+    svc.llm.extra_claims = [
+        {"text": "Dear Anna,", "kind": "framing", "format": "paragraph"},
+        {"text": "Sick leave is unlimited.", "kind": "framing"},      # a claim, not framing
+    ]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    texts = [s["text"] for s in r["segments"]]
+    assert "Dear Anna," in texts and "Sick leave is unlimited." not in texts
+    assert r["diagnostics"]["verification"]["framing"] == {"kept": {"framing": 1}, "removed": {"framing": 1}}
+
+
 def test_invented_citation_id_is_rejected(ready):
     svc, cid, _ = ready
     svc.llm.extra_claims = [{"text": "Sick leave is 10 days.", "citations": ["d_fake:s999"]}]
