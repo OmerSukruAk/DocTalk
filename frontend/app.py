@@ -404,7 +404,8 @@ def assistant_body(msg: dict, m: int, question: str | None = None, show_details:
     if status == "partial":
         dropped = msg.get("dropped_claims")
         what = f"{dropped} statement{'s' if dropped != 1 else ''}" if dropped else "Some statements"
-        notes.append(html.Div([icon("shield-check", 13), f"{what} removed: the documents did not support them."],
+        them = "it" if dropped == 1 else "them"
+        notes.append(html.Div([icon("shield-check", 13), f"{what} removed: the documents did not support {them}."],
                               className="meta"))
     cards = [source_card(c, {"type": "cite", "m": m, "n": c["n"], "k": "src"}) for c in citations]
     footer = None if show_details else _metrics(msg.get("metrics"))  # the details panel already has it
