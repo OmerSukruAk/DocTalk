@@ -38,4 +38,3 @@ az containerapp create -g "$RG" -n "$WEB" --environment "$ENV" \
 echo "API: https://$(az containerapp ingress show -g "$RG" -n "$APP" --query fqdn -o tsv)"
 echo "UI:  https://$(az containerapp ingress show -g "$RG" -n "$WEB" --query fqdn -o tsv)"
 echo "Now: az keyvault secret set --vault-name $KV --name LLM-API-KEY --value <key>   (and EMBED-API-KEY), then restart the revision."
-echo "Persistent uploads: mount an Azure Files volume at /data/files (az containerapp env storage set ...) for multi-replica use."
