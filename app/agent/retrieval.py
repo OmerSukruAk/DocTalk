@@ -198,7 +198,11 @@ _OVERVIEW = re.compile(
 _GENERIC = frozenset(
     "document documents doc docs file files pdf pdfs report reports text content contents whole entire "
     "uploaded give please short brief briefly quick quickly provide write explain tell main key points "
-    "simple simply detail detailed few sentences bullet bullets words paragraph".split()
+    "simple simply detail detailed few sentences bullet bullets words paragraph point points".split()
+    # counts and audiences are format, not topic: "in three bullets for a new employee"
+    + "one two three four five six seven eight nine ten".split()
+    + "new employee employees colleague colleagues manager managers team beginner beginners newcomer "
+    "newcomers executive executives customer customers everyone someone non technical".split()
 )
 
 

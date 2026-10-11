@@ -86,6 +86,10 @@ def test_overview_questions_are_detected_but_topic_summaries_are_not():
     assert is_overview_question("Give me the key takeaways in 3 bullets")
     assert is_overview_question("Summarize NN Group Framework", ["NN Group_Framework.pdf"])
     assert not is_overview_question("Summarise the dividend policy")
+    # counts and audiences are format, not topic (the demo script's questions)
+    assert is_overview_question("Summarise the documents in three bullet points")
+    assert is_overview_question("Summarise the documents in three bullet points for a new employee.")
+    assert not is_overview_question("Summarise the expense policy for a new employee")
     assert not is_overview_question("How many days of sick leave do I get?")
 
 
