@@ -28,12 +28,12 @@ PRINCIPAL=$(az containerapp show -g "$RG" -n "$APP" --query identity.principalId
 az role assignment create --assignee "$PRINCIPAL" --role "Key Vault Secrets User" \
   --scope "$(az keyvault show -n "$KV" --query id -o tsv)"
 
-# Web UI: its own app; calls the API by its internal name inside the environment. No secrets, no dev
-# issuer (ISSUER_URL empty), so users sign in with an Entra access token.
+# Web UI: its own app; calls the API by its internal name inside the environment. No secrets;
+# users sign in with an Entra access token, which the API validates.
 az containerapp create -g "$RG" -n "$WEB" --environment "$ENV" \
   --image "$ACR.azurecr.io/doctalk-frontend:latest" --registry-server "$ACR.azurecr.io" --registry-identity system \
   --system-assigned --target-port 8050 --ingress external --min-replicas 1 --max-replicas 3 \
-  --env-vars API_URL="http://$APP" ISSUER_URL=""
+  --env-vars API_URL="http://$APP"
 
 echo "API: https://$(az containerapp ingress show -g "$RG" -n "$APP" --query fqdn -o tsv)"
 echo "UI:  https://$(az containerapp ingress show -g "$RG" -n "$WEB" --query fqdn -o tsv)"

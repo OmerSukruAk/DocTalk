@@ -9,8 +9,6 @@ import os
 import httpx
 
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
-# Local dev token issuer (AUTH_MODE=dev). Empty in Entra deployments: the UI then asks for a token.
-ISSUER_URL = os.getenv("ISSUER_URL", "http://localhost:9000").rstrip("/")
 TIMEOUT_S = float(os.getenv("API_TIMEOUT_S", "180"))  # answers with a judge call can take a while
 
 
@@ -40,12 +38,6 @@ def _call(method: str, url: str, token: str | None = None, raw: bool = False, **
     if response.status_code >= 400:
         raise ApiError(response.status_code, _detail(response))
     return response.content if raw else response.json()
-
-
-def dev_token(user: str) -> str:
-    if not ISSUER_URL:
-        raise ApiError(0, "No dev issuer configured; paste an Entra access token instead.")
-    return _call("POST", f"{ISSUER_URL}/token", params={"user": user})["access_token"]
 
 
 def list_conversations(token: str) -> list[dict]:

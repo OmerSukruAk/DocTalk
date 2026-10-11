@@ -74,7 +74,8 @@ def _display_name(token: str) -> str:
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     except (IndexError, ValueError, binascii.Error):
         return "User"
-    return str(claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "User")
+    name = claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "User"
+    return str(name).removeprefix("user-")  # dev issuer object ids look like "user-alice"
 
 
 # --- answer rendering ---------------------------------------------------------------------------
@@ -240,23 +241,19 @@ def empty_state() -> html.Div:
 # --- layout -------------------------------------------------------------------------------------
 
 def signin_view() -> html.Div:
-    token_open = None if api.ISSUER_URL else "token"
+    """Sign-in needs an access token: Entra ID in production, the dev issuer locally (see README)."""
     return html.Div(dmc.Paper([
         html.Div(icon("message-2", 30), className="hero-icon", style={"margin": "0 auto"}),
         dmc.Title("Welcome to DocTalk", order=2, ta="center", mt="lg", className="hero-title"),
         dmc.Text("Discuss your documents. Every answer comes with its sources.",
                  c="dimmed", ta="center", size="sm", mb="xl"),
         dmc.Stack([
-            dmc.TextInput(id="signin-user", label="Your name", value="alice", size="md", radius="md"),
-            dmc.Button("Continue", id="signin-btn", fullWidth=True, size="md"),
-        ], gap="sm", display="flex" if api.ISSUER_URL else "none"),
-        dmc.Accordion(dmc.AccordionItem([
-            dmc.AccordionControl("Sign in with an access token"),
-            dmc.AccordionPanel(dmc.Stack([
-                dmc.PasswordInput(id="signin-token", placeholder="Paste an Entra ID bearer token", radius="md"),
-                dmc.Button("Use token", id="signin-token-btn", variant="light", fullWidth=True),
-            ], gap="sm")),
-        ], value="token"), value=token_open, variant="default", mt="md", className="token-acc"),
+            dmc.PasswordInput(id="signin-token", label="Access token", placeholder="Paste your bearer token",
+                              size="md", radius="md"),
+            dmc.Button("Sign in", id="signin-btn", fullWidth=True, size="md"),
+        ], gap="sm"),
+        dmc.Text("Your identity comes from the token, which the API verifies.", c="dimmed", ta="center",
+                 size="xs", mt="md"),
     ], className="signin-card", p=36, shadow="lg"), className="signin", id="signin-view")
 
 
@@ -365,29 +362,20 @@ app.layout = dmc.MantineProvider([
     Output("session", "data"),
     Output("notify", "sendNotifications"),
     Input("signin-btn", "n_clicks"),
-    Input("signin-user", "n_submit"),
-    Input("signin-token-btn", "n_clicks"),
-    State("signin-user", "value"),
+    Input("signin-token", "n_submit"),
     State("signin-token", "value"),
     prevent_initial_call=True,
     running=[(Output("signin-btn", "loading"), True, False)],
 )
-def sign_in(_btn, _enter, _token_btn, user, pasted):
+def sign_in(_btn, _enter, pasted):
+    token = (pasted or "").strip()
+    if not token:
+        return no_update, notify("Paste an access token first.")
     try:
-        if ctx.triggered_id == "signin-token-btn":
-            token = (pasted or "").strip()
-            if not token:
-                return no_update, notify("Paste an access token first.")
-            name = _display_name(token)
-        else:
-            name = (user or "").strip()
-            if not name:
-                return no_update, notify("Enter a name to continue.")
-            token = api.dev_token(name)
-        api.list_conversations(token)  # validates the token before we keep it
+        api.list_conversations(token)  # the API validates signature, issuer, audience and expiry
     except api.ApiError as exc:
         return no_update, notify(exc.detail, "Could not sign in")
-    return {"token": token, "user": name}, no_update
+    return {"token": token, "user": _display_name(token)}, no_update
 
 
 @app.callback(Output("session", "data", allow_duplicate=True), Input("signout", "n_clicks"),

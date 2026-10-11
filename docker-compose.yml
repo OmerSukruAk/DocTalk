@@ -10,8 +10,7 @@ services:
   frontend:
     build: ./frontend
     environment:
-      API_URL: http://api:8000
-      ISSUER_URL: http://dev-issuer:9000   # empty when AUTH_MODE=entra: the UI then asks for a token
+      API_URL: http://api:8000          # sign-in: paste a token from the dev issuer (:9000) or Entra ID
     ports: ["8050:8050"]
     depends_on: [api]
   mongo:
