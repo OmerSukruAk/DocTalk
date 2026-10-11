@@ -1,3 +1,8 @@
+[![Watch the video](https://img.youtube.com/vi/PFt1Bu1XGnU/maxresdefault.jpg)](https://youtu.be/PFt1Bu1XGnU)
+
+
+
+
 # DocTalk – discuss your documents
 
 Upload 1–5 internal documents (PDF, DOCX or Markdown), ask questions, and get answers that come
