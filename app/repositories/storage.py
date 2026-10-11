@@ -318,10 +318,14 @@ class ConversationRepo:
         segments: list[dict] | None = None,
         citations: list[dict] | None = None,
         status: str = "ok",
+        details: dict | None = None,
     ) -> str:
+        """``details`` (metrics, diagnostics, style, ...) is shown again when the conversation is
+        reopened; it never reaches the model, which only sees role and text (``recent_history``)."""
         message_id = "m_" + uuid.uuid4().hex[:16]
         self._msgs.insert_one(
             {
+                **(details or {}),
                 "_id": message_id,
                 "owner_key": owner_key,
                 "conversation_id": conversation_id,

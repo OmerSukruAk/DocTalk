@@ -363,7 +363,7 @@ def answer_details(msg: dict, question: str | None) -> list:
     ], justify="space-between")
     if msg.get("metrics"):
         return [header, _warnings(msg), html.Div(_steps(msg, question), className="steps")]
-    # saved answers keep their text, status and sources, not the per-step data
+    # answers saved before the details were stored keep their text, status and sources only
     segments = msg.get("segments") or []
     citations = msg.get("citations") or []
     kinds = {k: sum(1 for s in segments if s.get("kind", "fact") == k) for k in ("fact", "insight", "gap")}
@@ -372,7 +372,7 @@ def answer_details(msg: dict, question: str | None) -> list:
         header, _warnings(msg),
         dmc.Text(f"{_plural(kinds['fact'], 'fact')} · {kinds['insight']} analysis · {_plural(kinds['gap'], 'gap')} · "
                  f"{_plural(len(citations), 'sentence')} cited from {_plural(documents, 'document')}", size="sm"),
-        dmc.Text("Step times, tokens and warnings are shown for answers given in this session.",
+        dmc.Text("Step times, tokens and warnings were not saved for this older answer.",
                  size="xs", c="dimmed"),
     ]
 

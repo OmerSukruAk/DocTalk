@@ -113,6 +113,21 @@ def test_hallucinated_claim_is_dropped_and_answer_is_partial(ready):
     assert r["diagnostics"]["verification"]["rules"]["removed"] == {"fact": 1}
 
 
+def test_answer_details_are_stored_with_the_message_but_never_reach_the_model(ready):
+    svc, cid, _ = ready
+    sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
+    svc.llm.extra_claims = [{"text": "Sick leave is 99 days per year.", "citations": [sid]}]
+    r = ask(svc, cid, "How many sick leave days do I get?")
+    saved = svc.conversations.list_messages(OWNER, cid)[-1]
+    # reopening the conversation shows the same details as the live answer
+    for key in ("metrics", "diagnostics", "dropped_claims"):
+        assert saved[key] == r[key]
+    assert saved["diagnostics"]["removed"][0]["text"] == "Sick leave is 99 days per year."
+    # the history the model sees is role and text only: the removed statement is not in it
+    history = svc.conversations.recent_history(OWNER, cid)
+    assert all(set(m) == {"role", "text"} and "99" not in m["text"] for m in history)
+
+
 def test_sentence_ids_written_into_the_text_are_moved_to_citations(ready):
     svc, cid, _ = ready
     sid = ask(svc, cid, "sick leave days")["citations"][0]["sentence_id"]
