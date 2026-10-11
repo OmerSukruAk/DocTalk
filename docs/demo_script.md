@@ -1,7 +1,8 @@
 # Demo script (≈ 8 minutes)
 
 **Setup (before the call):** `docker compose up -d`, wait for `/healthz`. Keep `eval/docs/hr_policy.md`
-and `it_security.md` handy. Open the web UI (`:8050`), signed in as `alice`. Keep a terminal and Swagger
+and `it_security.md` handy. Get tokens for `alice` and `bob` (`POST :9000/token?user=alice`) and sign in to the web UI (`:8050`)
+with alice's. Keep a terminal and Swagger
 (`:8000/docs`) as backup; every UI step below also works with `python scripts/doctalk_cli.py demo eval/docs/*.md`.
 
 | # | Do | Say | Show |
@@ -16,7 +17,7 @@ and `it_security.md` handy. Open the web UI (`:8050`), signed in as `alice`. Kee
 | 7b | UI: settings icon left of the input → *Answer style* `casual, like a message to a friend`, ask again; or ask in Turkish | "Same facts, same citations, different voice / language." | Tone changes, citations don't |
 | 7 | Swagger: `GET /v1/passages/{sentence_id}?context=2` | "Every citation can be opened in context." | Passage + neighbours |
 | 8 | Swagger: `GET /v1/admin/stats` (admin token: `POST :9000/token?admin=true`) | "Latency, cost, refusal rate for operations." | p50/p95, cost, refusal/error rates |
-| 9 | Sign out, sign in as `bob` | "Isolation comes from the token, not from a request field." | Bob sees no documents / refused |
+| 9 | Sign out, sign in with bob's token | "Isolation comes from the token, not from a request field." | Bob sees no documents / refused |
 
 **If something goes wrong:** the LLM unreachable → the API answers `status: "error"` politely (also a
 good thing to show on purpose: stop the LLM key, ask a question).

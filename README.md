@@ -12,7 +12,7 @@ docker compose up --build         # web UI :8050, api :8000, dev token issuer :9
 python scripts/doctalk_cli.py demo eval/docs/hr_policy.md eval/docs/it_security.md
 ```
 
-* **Web UI: <http://localhost:8050>**: sign in with any name, drop in documents, ask. Hover a `[n]` to preview its source; click it to open the document at that spot (PDF: the page, sentence highlighted).
+* **Web UI: <http://localhost:8050>**: sign in with an access token (locally: `curl -X POST "localhost:9000/token?user=alice"`, paste `access_token`), drop in documents, ask. Hover a `[n]` to preview its source; click it to open the document at that spot (PDF: the page, sentence highlighted).
 * Swagger UI: <http://localhost:8000/docs> (get a token from `POST :9000/token`, click *Authorize*).
 * Interactive CLI: `python scripts/doctalk_cli.py chat <files…>`
 * No `EMBED_API_KEY`? It still works in BM25-only mode (degraded but functional).
@@ -25,7 +25,7 @@ python scripts/doctalk_cli.py demo eval/docs/hr_policy.md eval/docs/it_security.
 
 Two containers, deployed independently: **`api`** (this FastAPI backend, `./Dockerfile`) and
 **`frontend`** (Dash + Mantine web UI, `./frontend/Dockerfile`). The UI holds no backend code and no
-secrets; it calls the API over HTTP, configured only by `API_URL` and `ISSUER_URL`, so the same image
+secrets; it calls the API over HTTP, configured only by `API_URL`, so the same image
 runs in Compose, Azure Container Apps or Kubernetes.
 
 ```
@@ -148,7 +148,8 @@ cost figures use the prices you put in `.env`.
   side-by-side boxes/cards are re-ordered); charts are read as their text labels only; no reasoning
   across many pages beyond the overview sample (top-k retrieval); BM25 is rebuilt per owner on change
   (fine for ≤ 5 docs).
-* The web UI's Entra sign-in is a pasted access token (no MSAL login flow yet); the dev issuer covers local use.
+* The web UI signs in with a pasted access token (no MSAL login page yet): from Entra ID in production,
+  from the dev issuer locally.
 * Rate limiting is per replica; use API Management / Redis in production. No antivirus scan on uploads.
 * The eval set is small (17 questions, 2 documents): a smoke test and a calibration tool, not a benchmark.
   **No evaluation numbers are included here because they must come from your LLM key**; run it and
