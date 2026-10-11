@@ -353,8 +353,13 @@ class ConversationRepo:
         return [d for d in (_clean(x) for x in docs) if d]
 
     def recent_history(self, owner_key: str, conversation_id: str, limit: int = 6) -> list[dict]:
-        docs = list(self.list_messages(owner_key, conversation_id, limit=limit))
-        return [{"role": m["role"], "text": m.get("text", "")} for m in docs]
+        """The LAST ``limit`` messages, oldest first (list_messages returns the first ones)."""
+        docs = (
+            self._msgs.find({"owner_key": owner_key, "conversation_id": conversation_id})
+            .sort("created_at", -1)
+            .limit(limit)
+        )
+        return [{"role": m["role"], "text": m.get("text", "")} for m in reversed(list(docs))]
 
 
 class LogRepo:
